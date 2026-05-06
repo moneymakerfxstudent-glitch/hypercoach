@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <!-- viewport-fit=cover lets the app extend into the iPhone safe areas -->
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no" />
+
+    <title>HyperCoach</title>
+    <meta name="description" content="Set-by-set adaptive hypertrophy coach." />
+
+    <!-- PWA manifest is injected by vite-plugin-pwa, but keep this for clarity -->
+    <link rel="manifest" href="/manifest.webmanifest" />
+
+    <!-- Theme color drives the address bar / status bar tint -->
+    <meta name="theme-color" content="#0a0a0a" />
+
+    <!-- iOS Safari standalone-mode flags. iOS still doesn't read the manifest
+         for these, so we set them on the page itself. -->
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="HyperCoach" />
+    <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png" />
+
+    <!-- Favicons -->
+    <link rel="icon" type="image/png" sizes="32x32" href="/icons/favicon-32.png" />
+    <link rel="icon" type="image/png" sizes="16x16" href="/icons/favicon-16.png" />
+
+    <!-- Prevent pull-to-refresh interfering with workout logging on Chrome Android.
+         Also keep iOS rubber-banding from looking weird in standalone mode. -->
+    <style>
+      html, body, #root { height: 100%; margin: 0; background: #0a0a0a; }
+      body { overscroll-behavior-y: contain; }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>

@@ -1,0 +1,12 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* iOS safe areas. We only pad the top globally — left/right would shrink the
+   centered phone-width column on landscape, and bottom is handled by the
+   fixed BottomNav itself so it can sit flush against the home indicator. */
+@supports (padding: max(0px)) {
+  body {
+    padding-top: env(safe-area-inset-top);
+  }
+}
