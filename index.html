@@ -2,34 +2,54 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <!-- viewport-fit=cover lets the app extend into the iPhone safe areas -->
+
+    <!-- viewport-fit=cover lets the app extend into the iPhone safe areas
+         (notch, dynamic island, home indicator). user-scalable=no prevents
+         zoom-on-double-tap that would mess with workout logging. -->
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no" />
 
     <title>HyperCoach</title>
-    <meta name="description" content="Set-by-set adaptive hypertrophy coach." />
+    <meta name="description" content="Set-by-set adaptive hypertrophy coach. Works fully offline." />
 
-    <!-- PWA manifest is injected by vite-plugin-pwa, but keep this for clarity -->
-    <link rel="manifest" href="/manifest.webmanifest" />
+    <!-- Web App Manifest. vite-plugin-pwa injects /manifest.webmanifest at
+         build time, but linking explicitly here helps some browsers. -->
+    <link rel="manifest" href="manifest.webmanifest" />
 
-    <!-- Theme color drives the address bar / status bar tint -->
+    <!-- Theme color drives the iOS status bar tint and Android nav bar. -->
     <meta name="theme-color" content="#0a0a0a" />
 
-    <!-- iOS Safari standalone-mode flags. iOS still doesn't read the manifest
-         for these, so we set them on the page itself. -->
+    <!-- ===== Apple-specific PWA meta tags =====
+         iOS doesn't fully honor the web manifest yet. These tags are what
+         actually make the app launch full-screen with no Safari chrome
+         when opened from the Home Screen. -->
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
     <meta name="apple-mobile-web-app-title" content="HyperCoach" />
-    <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png" />
 
-    <!-- Favicons -->
-    <link rel="icon" type="image/png" sizes="32x32" href="/icons/favicon-32.png" />
-    <link rel="icon" type="image/png" sizes="16x16" href="/icons/favicon-16.png" />
+    <!-- Apple Touch Icon: this is the icon iOS shows on the Home Screen.
+         iOS uses this directly, not the manifest icons array. 180×180 is
+         Apple's current recommended size — it scales down for older devices. -->
+    <link rel="apple-touch-icon" href="icons/apple-touch-icon.png" />
 
-    <!-- Prevent pull-to-refresh interfering with workout logging on Chrome Android.
-         Also keep iOS rubber-banding from looking weird in standalone mode. -->
+    <!-- Standard favicons for browser tabs. -->
+    <link rel="icon" type="image/png" sizes="32x32" href="icons/favicon-32.png" />
+    <link rel="icon" type="image/png" sizes="16x16" href="icons/favicon-16.png" />
+
+    <!-- Make pull-to-refresh sane in standalone mode. overscroll-behavior
+         prevents the rubber-band scroll from showing the white bounce
+         area underneath the dark UI. -->
     <style>
       html, body, #root { height: 100%; margin: 0; background: #0a0a0a; }
-      body { overscroll-behavior-y: contain; }
+      body {
+        overscroll-behavior-y: contain;
+        /* Prevent text selection on tap-and-hold for buttons, but allow it
+           in inputs/textareas for normal editing. */
+        -webkit-user-select: none;
+        user-select: none;
+        -webkit-tap-highlight-color: transparent;
+        -webkit-touch-callout: none;
+      }
+      input, textarea { -webkit-user-select: text; user-select: text; }
     </style>
   </head>
   <body>

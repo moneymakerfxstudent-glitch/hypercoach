@@ -1,93 +1,228 @@
-# HyperCoach — Adaptive Hypertrophy PWA
+# HyperCoach — Offline-First iOS PWA
 
-Set-by-set adaptive hypertrophy coach. Logs your set, recommends the next one. Fully installable, works offline, all data stays on your device.
+Set-by-set adaptive hypertrophy coach. **Works fully offline after install.** No PC server, no localhost, no internet required during workouts.
 
-## Stack
+## What you get
 
-- Vite + React 18
-- Tailwind for styling
-- `vite-plugin-pwa` for service worker + manifest generation (Workbox under the hood)
-- `localStorage` for persistence
+- iPhone home-screen app, launches full-screen with no Safari chrome
+- Service worker precaches the entire app shell on first visit
+- All workout data stored locally in `localStorage` — never leaves your device
+- System fonts only (SF Pro on iOS) — zero external dependencies
+- Persistent storage requested automatically to fight iOS eviction
+- **Per-exercise loading profiles** — never recommends impossible weights.
+  Configure each exercise's actual equipment (machine stack, dumbbells,
+  plates, decimal Matrix stacks, etc.) under Settings → Exercise Loading.
+- **Pause & resume workouts** — exit anytime; the app saves your progress
+  as paused, surfaces a Resume card on Home, and only marks workouts as
+  completed when you explicitly tap Finish.
+- **Edit completed workouts** — tap any session in History to fix typos,
+  add missed sets, or rename exercises. PRs, e1RM, and next-workout
+  recommendations recompute automatically from your edits.
 
-## Getting started
+## Architecture, in short
 
-```bash
-npm install
-npm run dev          # http://localhost:5173 — SW disabled in dev
-npm run build        # produces dist/ with hashed assets, manifest, and sw.js
-npm run preview      # serves dist/ locally so you can test SW + install flow
+```
+your iPhone
+    └── Home Screen icon
+            └── Standalone webview (offline-capable)
+                    ├── App shell (precached by service worker)
+                    └── localStorage (workout history, settings)
 ```
 
-The service worker is intentionally disabled during `vite dev` (set `devOptions.enabled: true` in `vite.config.js` if you want to test it). Always test PWA behavior with `npm run build && npm run preview`, or against a deployed build.
+After first install, **nothing on the network is required**. The app boots from cache, runs from cache, and writes only to localStorage.
 
-## Deploying
+---
 
-You need HTTPS in production — service workers won't register over HTTP. Any static host works (Vercel, Netlify, Cloudflare Pages, GitHub Pages with custom domain + HTTPS). Just point the host at `dist/`.
+## Step 1 — Build the app
 
-If you deploy to a subpath (e.g. `https://example.com/hypercoach/`), set `base: '/hypercoach/'` in `vite.config.js` and update the manifest's `start_url` and `scope` accordingly.
+You only need a computer for this once. After deploy, you never need your PC again.
 
-## Project structure
+```bash
+# In the project folder
+npm install
+npm run build
+```
+
+This produces a `dist/` folder containing:
+- `index.html`
+- `assets/*.js`, `assets/*.css` — hashed bundles
+- `sw.js` — service worker
+- `manifest.webmanifest` — PWA manifest
+- `icons/*.png` — all icon sizes
+
+Everything in `dist/` is static. No backend, no Node.js needed at runtime.
+
+## Step 2 — Deploy to a free HTTPS host
+
+iOS service workers **require HTTPS**. Your home Wi-Fi or PC IP won't work. The free options below all give you HTTPS automatically and take ~2 minutes.
+
+Pick **one** of these. I recommend **Cloudflare Pages** for stability and **Netlify drop** for speed.
+
+### Option A — Cloudflare Pages (recommended, 5 min)
+
+1. Sign up at https://dash.cloudflare.com/sign-up (free, no credit card).
+2. Push this project to a GitHub repo.
+3. In Cloudflare dashboard: **Workers & Pages → Create → Pages → Connect to Git**.
+4. Select your repo. Set:
+   - Build command: `npm run build`
+   - Build output: `dist`
+5. Click Save and Deploy. You get `https://hypercoach-xxx.pages.dev`.
+
+Every `git push` redeploys automatically.
+
+### Option B — Netlify Drop (fastest, no Git needed)
+
+1. Run `npm run build` locally.
+2. Open https://app.netlify.com/drop in any browser.
+3. Drag the `dist/` folder onto the page.
+4. You get `https://something-random-xxx.netlify.app` instantly with HTTPS.
+
+### Option C — Vercel CLI
+
+```bash
+npm install -g vercel
+npm run build
+vercel deploy --prod
+# Follow prompts; pick the dist folder as output
+```
+
+### Option D — GitHub Pages (custom domain required for PWA)
+
+GitHub Pages on a `*.github.io` URL works, but the SW scope can be tricky on subpaths. If you go this route, set `base: '/<your-repo-name>/'` in `vite.config.js`. Easiest avoided unless you already use it.
+
+---
+
+## Step 3 — Install on iPhone
+
+After Step 2 you have an HTTPS URL like `https://hypercoach-xxx.pages.dev`.
+
+**On your iPhone:**
+
+1. Open **Safari** (not Chrome — iOS only allows PWA installs from Safari).
+2. Type or paste your URL into the address bar and load the page.
+3. Wait ~5 seconds. The service worker registers and precaches the app — you'll see this happen automatically.
+4. Tap the **Share** icon at the bottom of the screen (square with up-arrow).
+5. Scroll down and tap **Add to Home Screen**.
+6. Tap **Add** in the top-right corner.
+
+The HyperCoach icon appears on your home screen. Tap it.
+
+The app launches **full-screen**, with no Safari address bar, no tabs, no chrome. It looks and feels like a native app.
+
+## Step 4 — Verify offline mode
+
+Now prove it works without a server:
+
+1. On your iPhone, swipe up to open Control Center.
+2. Turn on **Airplane Mode**.
+3. Tap the HyperCoach icon on your home screen.
+
+The app should launch, look identical, and let you log a full workout. Sets save, history shows, recommendations work.
+
+Reopen Settings inside the app — the **App Status** card will show:
+- ✅ Installed · running standalone
+- ✅ Offline — app still works
+- ✅ Storage marked persistent · safe from auto-eviction
+
+You're done. Your iPhone now has a fully self-contained workout coach that doesn't depend on your PC, your home network, or anything else.
+
+---
+
+## What's actually happening
+
+### Service worker
+
+`vite-plugin-pwa` generates a Workbox-based service worker at build time (`dist/sw.js`). On first visit:
+
+1. Browser downloads the SW
+2. SW intercepts the precache list and downloads every JS/CSS/HTML/image into the Cache Storage API
+3. SW becomes active
+4. Subsequent navigations are served from cache, network bypassed entirely
+
+The SW config lives in `vite.config.js`:
+
+- `registerType: 'autoUpdate'` — when you ship a new build, users get it on next launch
+- `cleanupOutdatedCaches: true` — old SW caches get purged
+- `navigateFallback: 'index.html'` — SPA routing works offline
+- `runtimeCaching: []` — intentionally empty, **the app uses no external resources**
+
+### Storage
+
+Two `localStorage` keys:
+
+- `hypercoach:history:v1` — array of completed workouts
+- `hypercoach:settings:v1` — units, increments, rep targets
+
+That's it. No backend, no sync, no servers.
+
+### iOS persistence quirk
+
+iOS evicts script-writable storage after ~7 days of non-use, **unless** the page is added to the home screen and `navigator.storage.persist()` returns true. We call this on every app launch (see `useInstallPrompt.js`). After installation, iOS grants persistent storage automatically. The Settings screen confirms this.
+
+---
+
+## Local-only testing (without deploy)
+
+If you want to verify the build before deploying:
+
+```bash
+npm run build
+npm run preview
+# Opens http://localhost:4173
+```
+
+The SW works on `localhost` (browsers grant it secure-context status there). But to test on **your iPhone over Wi-Fi**, you need HTTPS — and that's what Step 2 is for.
+
+Some devs use `ngrok http 4173` for a temporary HTTPS tunnel during testing. That's fine for verification but **not the goal here** — your phone shouldn't need your PC to be running.
+
+---
+
+## Updating the app
+
+After first install, when you push a new build:
+
+1. The SW detects the new version on next page load
+2. Downloads the new files in the background
+3. Activates the new version (skipWaiting + clientsClaim ensure no double-load required)
+4. Next time the user opens the app, they're on the new version
+
+No App Store, no review process, no update prompts. Ship as often as you want.
+
+---
+
+## Project layout
 
 ```
 public/
-  icons/                  PNG icons referenced by the manifest
+  icons/                    PNG icons for manifest + apple-touch
 src/
-  HyperCoach.jsx          Main app (UI + recommendation engine)
-  InstallModal.jsx        Platform-specific install instructions
-  useInstallPrompt.js     Hook for beforeinstallprompt + standalone detection
-  main.jsx                React entry
-  index.css               Tailwind + safe-area handling
-index.html                Manifest link, iOS meta tags, theme color
-vite.config.js            VitePWA plugin config (manifest + workbox runtime caching)
-scripts/generate-icons.mjs  Regenerate icons (run if you change the source SVG)
+  HyperCoach.jsx            Main app
+  InstallModal.jsx          Platform-specific install instructions
+  useInstallPrompt.js       beforeinstallprompt + persistent storage
+  main.jsx                  React entry + SW registration
+  index.css                 Tailwind + system-font display class
+index.html                  iOS PWA meta tags
+vite.config.js              VitePWA config (Workbox SW + manifest)
+scripts/generate-icons.mjs  Regenerate icons from inline SVG
 ```
 
-## Data
+## Known iOS limitations (worth knowing)
 
-All workout history and settings live in `localStorage` under two keys:
+- **Cache cap**: Safari historically capped Cache Storage at ~50MB per origin. Safari 17+ allows much more, but stay lean. Our build is well under 1MB total.
+- **Home Screen launch only**: PWA features (offline, persistent storage, full-screen) only apply when launched from the home screen icon. Opening the same URL in a Safari tab won't behave the same way.
+- **No background sync**: iOS service workers can't run while the app is closed. We don't need this — the app is fully synchronous.
+- **Updates need an open**: SW updates check on app launch. The app must be opened at least once to pull a new version.
 
-- `hypercoach:history:v1` — array of completed workouts
-- `hypercoach:settings:v1` — units, increment, rep targets
+## When something goes wrong
 
-Nothing leaves the device. There's an Export option in Settings that downloads a JSON backup; you can restore by pasting the JSON into localStorage manually (a proper Import flow can be added later).
+**App doesn't work offline after install.**
+The SW didn't finish caching before you went offline. Open Safari with internet, navigate to the URL, wait 10 seconds, then try again.
 
-## Install instructions
+**App looks broken / old version showing.**
+SW cache stale. In Safari: Settings → Safari → Advanced → Website Data → search HyperCoach → delete. Then reinstall from home screen.
 
-The app shows these in-app via the Install button on Settings, but for reference:
+**Add to Home Screen option missing.**
+You're using Chrome on iOS. Open the URL in **Safari** instead — iOS only supports PWA install from Safari directly.
 
-### iPhone / iPad (Safari only)
-
-1. Open the deployed URL in **Safari**. Chrome on iOS does not support PWA installs.
-2. Tap the **Share** icon (the square with the up-arrow at the bottom of the screen).
-3. Scroll down and tap **Add to Home Screen**.
-4. Tap **Add** in the top-right corner.
-
-The icon appears on your home screen and launches in standalone mode (no Safari chrome).
-
-### Android (Chrome)
-
-If the browser supports it, an **Install HyperCoach** button will appear inside the app — one tap installs. Otherwise:
-
-1. Tap the **three-dot menu** in Chrome's top-right.
-2. Tap **Install app** (or **Add to Home screen** on older Android).
-3. Confirm **Install**.
-
-### Desktop (Chrome / Edge)
-
-Look for the install icon on the right side of the address bar — a small monitor with a downward arrow. Click it, then click **Install**. The app opens in its own window.
-
-## Updating the icon
-
-Edit the SVG-generation logic in `scripts/generate-icons.mjs`, then run:
-
-```bash
-node scripts/generate-icons.mjs
-```
-
-You'll get fresh `icon-192.png`, `icon-512.png`, maskable variants, and the apple-touch-icon. Rebuild and redeploy to ship.
-
-## Known limitations
-
-- Custom font (Google Fonts) requires one online load to populate the runtime cache. After that it works offline.
-- iOS doesn't expose a programmatic install prompt, so iOS users always go through the manual Share → Add to Home Screen flow.
-- `localStorage` has a ~5MB cap. The data model is small (each set is a few hundred bytes); a year of daily training is well under 1MB. If you ever hit the limit, migrating to IndexedDB is straightforward.
+**App opens in Safari with the address bar showing.**
+You opened the bookmark, not the home screen icon. Or `display: standalone` isn't being honored — check the manifest is loading (Safari → Develop → Show Web Inspector when phone is connected via USB).

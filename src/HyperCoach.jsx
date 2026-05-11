@@ -5,20 +5,29 @@ import {
   TrendingUp, Trophy, Target, Save, Download, Trash2, Search,
   Activity, Zap, Award, Clock, BarChart3, Edit3, ArrowRight,
   CheckCircle2, AlertTriangle, Info, Play, Square, Repeat,
-  LifeBuoy, Shield, Smartphone,
+  LifeBuoy, Shield, Smartphone, Wifi, WifiOff, Pause, PlayCircle,
+  Sliders, RotateCcw,
 } from 'lucide-react';
 import { useInstallPrompt } from './useInstallPrompt.js';
 import { InstallModal } from './InstallModal.jsx';
+import {
+  roundToAvailable, directionForTag, profileForExercise,
+  availableWeights, describeProfile, DEFAULT_PROFILE, PROFILE_TYPES,
+} from './loadingProfiles.js';
 
 // ============================================================
 // CONSTANTS
 // ============================================================
 const DEFAULT_SETTINGS = {
   unit: 'kg',
-  increment: 2.5,
+  increment: 2.5, // legacy — still used as fallback for old workouts
   targetMin: 7,
   targetMax: 12,
   targetIdeal: 9,
+  // Global default loading profile, used when an exercise has no override
+  defaultProfile: { ...DEFAULT_PROFILE },
+  // Per-exercise loading profiles, keyed by exercise name
+  exerciseProfiles: {},
 };
 
 const COMMON_EXERCISES = [
@@ -62,7 +71,9 @@ const STORAGE_KEYS = {
 // ============================================================
 const epley1RM = (w, r) => w * (1 + r / 30);
 const weightForReps = (e1rm, r) => e1rm / (1 + r / 30);
-const roundIncrement = (w, inc) => Math.max(inc, Math.round(w / inc) * inc);
+// (roundIncrement was removed — loading profiles handle all snapping now.
+// See loadingProfiles.js)
+
 const fmt = (n) => {
   if (!Number.isFinite(n)) return '0';
   return Number.isInteger(n) ? `${n}` : `${parseFloat(n.toFixed(1))}`;
@@ -70,7 +81,9 @@ const fmt = (n) => {
 const fmtWeight = (w, unit) => `${fmt(w)}${unit}`;
 
 function calcWeeklyStreak(history) {
-  if (!history.length) return 0;
+  // Only completed workouts count toward the streak.
+  const completed = history.filter(w => w.status === 'completed' || w.status === undefined);
+  if (!completed.length) return 0;
   const startOfWeek = (d) => {
     const x = new Date(d);
     const day = x.getDay() || 7;
@@ -78,7 +91,7 @@ function calcWeeklyStreak(history) {
     x.setHours(0, 0, 0, 0);
     return x.getTime();
   };
-  const weeks = new Set(history.map(w => startOfWeek(w.startedAt)));
+  const weeks = new Set(completed.map(w => startOfWeek(w.startedAt)));
   let cursor = startOfWeek(Date.now());
   let streak = 0;
   if (weeks.has(cursor)) {
@@ -104,19 +117,24 @@ function fmtRelativeDate(ts) {
 // ============================================================
 // RECOMMENDATION ENGINE
 // ============================================================
+//
+// The internal recommendation functions produce IDEAL theoretical weights.
+// They do NOT round to gym-realistic increments — that's the job of the
+// loading profile, applied at the orchestrator boundary in
+// getWorkoutRecommendation. Keeping it this way means the engine stays
+// pure-math and the profile logic lives in one place.
 function recommendNextSet(lastSet, allSetsThisExercise, settings) {
   const { weight, reps, failure, form } = lastSet;
-  const { targetMin, targetMax, targetIdeal, increment, unit } = settings;
+  const { targetMin, targetMax, targetIdeal } = settings;
   const e1rm = epley1RM(weight, reps);
 
   // Bad form override — biggest cut, ignore other factors
   if (form === 'bad') {
-    const next = roundIncrement(weight * 0.85, increment);
     return {
-      weight: next,
+      weight: weight * 0.85,
       repRange: [targetMin, targetMax],
       targetReps: targetIdeal,
-      reason: `Form broke down on that set. Cutting load to ${fmtWeight(next, unit)} so the next set is technically clean.`,
+      reason: `Form broke down on that set. Cutting load so the next set is technically clean.`,
       e1rm,
       tag: 'reset',
     };
@@ -138,7 +156,7 @@ function recommendNextSet(lastSet, allSetsThisExercise, settings) {
     baseWeight = weightForReps(e1rm, targetIdeal);
     tag = 'too-heavy';
     targetReps = targetIdeal;
-    reason = `${fmtWeight(weight, unit)} × ${reps} is too heavy for hypertrophy. Dropping to land you in the ${targetMin}–${targetMax} range.`;
+    reason = `${fmtWeight(weight, settings.unit)} × ${reps} is too heavy for hypertrophy. Dropping to land you in the ${targetMin}–${targetMax} range.`;
   } else if (reps === 6) {
     baseWeight = weight * 0.95;
     tag = 'adjust';
@@ -146,8 +164,7 @@ function recommendNextSet(lastSet, allSetsThisExercise, settings) {
     reason = `6 reps is just under the band. Small drop to bring you back inside ${targetMin}–${targetMax}.`;
   } else if (reps >= targetMin && reps <= targetMax) {
     if (failure) {
-      baseWeight = weight; // fatigue cut applied below
-      // Target slightly lower reps as fatigue accumulates
+      baseWeight = weight;
       targetReps = Math.max(targetMin, Math.min(reps, reps - Math.floor(priorFailureSets / 2)));
       reason = `${reps} reps to failure was on target. Slight cut for fatigue keeps the next set in the band.`;
     } else {
@@ -157,22 +174,20 @@ function recommendNextSet(lastSet, allSetsThisExercise, settings) {
       reason = `${reps} reps but not at failure — repeat the load and push closer to the limit.`;
     }
   } else {
-    // reps > targetMax
-    baseWeight = weightForReps(e1rm, targetIdeal);
-    if (baseWeight <= weight) baseWeight = weight + increment;
+    // reps > targetMax — bump up. The orchestrator will round UP via the
+    // 'progress' tag, so a slight bump above current is enough; the profile
+    // will land on the next real weight.
+    baseWeight = Math.max(weightForReps(e1rm, targetIdeal), weight * 1.025);
     tag = 'progress';
     targetReps = targetIdeal;
     reason = `${reps} reps means the load was light. Bumping up to bring you back to ${targetMin}–${targetMax}.`;
   }
 
-  // Apply fatigue discount only when last set was failure
-  const finalWeight = roundIncrement(
-    baseWeight * (failure ? fatigueDiscount : 1),
-    increment
-  );
+  // Apply fatigue discount only when the last set was to failure.
+  const finalIdealWeight = baseWeight * (failure ? fatigueDiscount : 1);
 
   return {
-    weight: finalWeight,
+    weight: finalIdealWeight,
     repRange: [targetMin, targetMax],
     targetReps,
     reason,
@@ -231,7 +246,12 @@ function recommendOpeningSet(exerciseName, history, settings) {
 // PR & PROGRESSION LOGIC
 // ============================================================
 function exerciseSessions(exerciseName, history) {
+  // Only completed workouts count as session history for recommendations,
+  // PRs, and progression targets. Paused/discarded workouts are ignored
+  // here — they're tracked in history but they're not "what you did last
+  // session" for engine purposes.
   return history
+    .filter(w => w.status === 'completed' || w.status === undefined) // undefined for backward compat
     .flatMap(w => w.exercises
       .filter(e => e.name === exerciseName)
       .map(e => ({ ...e, when: w.startedAt, workoutId: w.id }))
@@ -434,19 +454,21 @@ function decideExtraRescueSet(rescueState, settings) {
     };
   }
 
-  // Recommend an extra back-off set
+  // Recommend an extra back-off set. We emit the ideal weight; the
+  // orchestrator snaps it through the loading profile (tag = rescue-extra
+  // → direction = down).
   const e1rm = epley1RM(last.weight, last.reps);
   const baseWeight = weightForReps(e1rm, settings.targetIdeal);
   // Heavier fatigue cut for the 4th+ working set
   const fatigueDiscount = Math.max(0.85, 1 - 0.025 * rescueState.workingCount);
-  const weight = roundIncrement(baseWeight * fatigueDiscount, settings.increment);
+  const idealWeight = baseWeight * fatigueDiscount;
 
   return {
     tag: 'rescue-extra',
-    weight,
+    weight: idealWeight,
     repRange: [settings.targetMin, settings.targetMax],
     targetReps: null,
-    reason: `Volume still ${fmt(Math.round(rescueState.volumeDeficit))}${settings.unit} short of last session. One extra back-off set at ${fmt(weight)}${settings.unit} for ${settings.targetMin}+ reps closes the gap and banks the win.`,
+    reason: `Volume still ${fmt(Math.round(rescueState.volumeDeficit))}${settings.unit} short of last session. One extra back-off set closes the gap and banks the win.`,
     e1rm,
   };
 }
@@ -454,50 +476,81 @@ function decideExtraRescueSet(rescueState, settings) {
 function getWorkoutRecommendation(exercise, history, settings) {
   const rescueState = computeRescueState(exercise, history, settings);
   const lastWorking = rescueState.lastWorkingSet;
+  const profile = profileForExercise(exercise.name, settings);
 
   // No working sets yet → opening recommendation (PR push if history exists)
   if (!lastWorking) {
-    return { rec: recommendOpeningSet(exercise.name, history, settings), rescueState };
+    const opening = recommendOpeningSet(exercise.name, history, settings);
+    // Opening reuses last session's actual weight, which IS valid for the
+    // profile (it was achievable last time). But we still snap defensively
+    // in case the profile changed since.
+    return { rec: snapRec(opening, profile, settings.unit), rescueState, profile };
   }
 
   // Rescue active and 3+ working sets done → check for extra set or stop signal
   if (rescueState.active && rescueState.workingCount >= RESCUE_STANDARD_SET_COUNT) {
     const decision = decideExtraRescueSet(rescueState, settings);
-    if (decision) return { rec: decision, rescueState };
+    if (decision) return { rec: snapRec(decision, profile, settings.unit), rescueState, profile };
   }
 
   // Standard adaptive recommendation
   const rec = recommendNextSet(lastWorking, exercise.sets, settings);
 
-  // Overlay rescue framing
+  // Overlay rescue framing before snapping (so the snap uses the rescue tag)
+  let framedRec = rec;
   if (rescueState.active) {
     if (rescueState.workingCount === 1) {
-      // Set 2: this is the recommendation right after the trigger set
-      return {
-        rec: {
-          ...rec,
-          tag: 'rescue',
-          targetReps: null, // show the range, not a "+N" target
-          reason: `${rescueState.triggerReason} Another heavy attempt isn't useful — chasing progress through back-off hypertrophy volume instead.`,
-        },
-        rescueState,
+      framedRec = {
+        ...rec,
+        tag: 'rescue',
+        targetReps: null,
+        reason: `${rescueState.triggerReason} Another heavy attempt isn't useful — chasing progress through back-off hypertrophy volume instead.`,
       };
+    } else {
+      framedRec = { ...rec, tag: 'rescue', targetReps: null };
     }
-    return {
-      rec: { ...rec, tag: 'rescue', targetReps: null },
-      rescueState,
-    };
   }
 
-  return { rec, rescueState };
+  return { rec: snapRec(framedRec, profile, settings.unit), rescueState, profile };
+}
+
+// Snap a recommendation's ideal weight to the profile's available weights,
+// using the tag to choose direction. If the profile snap reveals that the
+// "ideal" target was not actually achievable, we append a brief note so
+// the user understands why the displayed number isn't what the formula
+// suggested in the abstract.
+function snapRec(rec, profile, unit) {
+  if (!rec || rec.weight === null || rec.weight === undefined) return rec;
+  if (!Number.isFinite(rec.weight)) return rec;
+  const idealWeight = rec.weight;
+  const direction = directionForTag(rec.tag);
+  const snapped = roundToAvailable(idealWeight, profile, direction);
+  // If the snap moved the weight meaningfully (>0.5 unit) AND the user's
+  // profile is something other than the default fixed grid, surface the
+  // adjustment in the reason text.
+  let reason = rec.reason;
+  const moved = Math.abs(snapped - idealWeight) > 0.5;
+  const profileIsCustom = profile && profile.type !== 'fixed';
+  if (moved && profileIsCustom) {
+    reason = `${reason} Snapped to ${fmt(snapped)}${unit || ''} — closest weight your equipment actually offers.`;
+  }
+  return { ...rec, weight: snapped, idealWeight, reason };
 }
 
 // ============================================================
 // STORAGE
 // ============================================================
-// Synchronous localStorage adapter. Payload is tiny (a few KB even with
-// hundreds of sessions) so JSON-stringify on every write is fine. If the
-// dataset ever grows past ~5MB we'd want to migrate to IndexedDB.
+// Synchronous localStorage adapter. Payload is small (a few KB even with
+// hundreds of sessions) so JSON-stringify on every write is fine.
+//
+// Why localStorage and not IndexedDB:
+// - The data model is purely tabular and non-blocking
+// - Synchronous reads simplify React state hydration
+// - 5MB cap is generous for years of training data
+// - iOS treats both with the same eviction policy
+//
+// If we ever need media (videos, large blobs) or millions of records,
+// migrating to IndexedDB is a one-file change.
 const storage = {
   get(key) {
     try {
@@ -506,49 +559,22 @@ const storage = {
     } catch { return null; }
   },
   set(key, val) {
-    try { localStorage.setItem(key, JSON.stringify(val)); } catch {}
+    try { localStorage.setItem(key, JSON.stringify(val)); } catch (e) {
+      // QuotaExceededError or private-mode failure. Surface a console
+      // warning so the user can investigate via remote debugging.
+      console.warn('[hypercoach] storage.set failed', key, e);
+    }
   },
   del(key) {
     try { localStorage.removeItem(key); } catch {}
   },
 };
 
-// ============================================================
-// FONTS & GLOBAL STYLES
-// ============================================================
+// FontStyles is intentionally a no-op now. System fonts only — no Google
+// Fonts CDN, no external network on first launch. The `.font-display`
+// class is defined in index.css using SF Pro Display + font-stretch.
 function FontStyles() {
-  useEffect(() => {
-    const id = 'hypercoach-fonts';
-    if (document.getElementById(id)) return;
-    const link = document.createElement('link');
-    link.id = id;
-    link.rel = 'stylesheet';
-    link.href = 'https://fonts.googleapis.com/css2?family=Anton&family=Sora:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap';
-    document.head.appendChild(link);
-  }, []);
-  return (
-    <style>{`
-      .font-display { font-family: 'Anton', 'Impact', sans-serif; letter-spacing: 0.02em; }
-      .font-body { font-family: 'Sora', system-ui, sans-serif; }
-      .font-mono { font-family: 'JetBrains Mono', ui-monospace, monospace; }
-      .scrollbar-hide::-webkit-scrollbar { display: none; }
-      .scrollbar-hide { -ms-overflow-style: none; scrollbar-width: none; }
-      input[type=number]::-webkit-inner-spin-button,
-      input[type=number]::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
-      input[type=number] { -moz-appearance: textfield; }
-      @keyframes pulse-ring {
-        0% { box-shadow: 0 0 0 0 rgba(249, 115, 22, 0.4); }
-        70% { box-shadow: 0 0 0 12px rgba(249, 115, 22, 0); }
-        100% { box-shadow: 0 0 0 0 rgba(249, 115, 22, 0); }
-      }
-      .pulse-ring { animation: pulse-ring 2s infinite; }
-      @keyframes slide-up {
-        from { opacity: 0; transform: translateY(8px); }
-        to { opacity: 1; transform: translateY(0); }
-      }
-      .slide-up { animation: slide-up 0.3s ease-out; }
-    `}</style>
-  );
+  return null;
 }
 
 // ============================================================
@@ -605,32 +631,148 @@ function BottomNav({ screen, onNav, inWorkout }) {
   );
 }
 
-function Stepper({ value, onChange, step, min = 0, max = 9999, decimals = 0, large = false }) {
-  const dec = () => onChange(Math.max(min, parseFloat((value - step).toFixed(2))));
-  const inc = () => onChange(Math.min(max, parseFloat((value + step).toFixed(2))));
+// Stepper — number input with +/− buttons that respects mobile editing.
+//
+// Why a string buffer? React's controlled-number-input pattern (`value={n}`,
+// onChange parses) breaks free-form editing badly: clearing the field is
+// awkward because the input snaps back to 0 immediately, and typing "32."
+// (mid-decimal) is invisible because parseFloat("32.") === 32.
+//
+// Solution: while focused, hold the raw text the user typed. On blur OR
+// when the parent value is changed externally (e.g. recommendation update),
+// re-sync. This gives:
+//   • free-form typing including decimals like "32.5"
+//   • clear-to-empty without snap-back
+//   • tap-to-select-all for fast overwrite
+//   • +/− buttons that still always operate on the parsed numeric value
+//   • a clear (×) button for one-tap reset
+function Stepper({
+  value, onChange,
+  step, min = 0, max = 9999,
+  large = false,
+  allowDecimal = true,
+}) {
+  // Local string buffer for the *currently typed* text. null means "not
+  // editing right now, mirror the parent value".
+  const [draft, setDraft] = useState(null);
+  const inputRef = useRef(null);
+
+  // Re-sync when the parent value changes from outside (e.g. recommendation
+  // refresh after a set is logged) and we're not actively editing.
+  useEffect(() => {
+    if (draft === null) {
+      // mirroring; nothing to do — input displays parent value directly
+    }
+  }, [value, draft]);
+
+  const display = draft !== null ? draft : fmt(value);
+
+  const commit = (raw) => {
+    if (raw === '' || raw === '-' || raw === '.') {
+      // Empty or partial input on blur — keep current parent value
+      setDraft(null);
+      return;
+    }
+    let n = parseFloat(raw);
+    if (!Number.isFinite(n)) {
+      setDraft(null);
+      return;
+    }
+    if (!allowDecimal) n = Math.round(n);
+    n = Math.min(max, Math.max(min, n));
+    onChange(parseFloat(n.toFixed(2)));
+    setDraft(null);
+  };
+
+  const handleChange = (e) => {
+    const v = e.target.value;
+    // Allow only sane numeric characters (digits, one decimal point,
+    // optional leading minus if min < 0).
+    const pattern = allowDecimal
+      ? /^-?\d*\.?\d*$/
+      : /^-?\d*$/;
+    if (v === '' || pattern.test(v)) {
+      setDraft(v);
+    }
+  };
+
+  const handleFocus = (e) => {
+    // Defer the select() to next tick — iOS Safari needs this or it
+    // collapses the selection back to the caret position.
+    setTimeout(() => {
+      try { e.target.select(); } catch {}
+    }, 0);
+  };
+
+  const handleBlur = (e) => commit(e.target.value);
+  const handleKey = (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      e.target.blur();
+    }
+  };
+
+  const dec = () => {
+    // Operate on parent value, not draft — pressing − while editing should
+    // step from the real current value, not whatever fragment is typed.
+    onChange(Math.max(min, parseFloat((value - step).toFixed(2))));
+    setDraft(null);
+  };
+  const inc = () => {
+    onChange(Math.min(max, parseFloat((value + step).toFixed(2))));
+    setDraft(null);
+  };
+
+  const showClear = draft !== null && draft !== '';
+
   return (
     <div className="flex items-stretch gap-1.5 w-full">
       <button
+        type="button"
         onClick={dec}
         className="w-10 flex-shrink-0 bg-neutral-800 hover:bg-neutral-700 active:bg-neutral-600 rounded-lg flex items-center justify-center text-neutral-300"
+        aria-label="Decrease"
       >
         <Minus size={18} strokeWidth={2.5} />
       </button>
-      <input
-        type="number"
-        inputMode="decimal"
-        value={value}
-        step={step}
-        onChange={e => {
-          const v = parseFloat(e.target.value);
-          if (!isNaN(v)) onChange(v);
-          else onChange(0);
-        }}
-        className={`min-w-0 flex-1 w-full bg-neutral-900 border border-neutral-800 rounded-lg text-center text-white font-mono font-bold px-1 ${large ? 'text-2xl py-2' : 'text-lg py-1.5'}`}
-      />
+      <div className="relative min-w-0 flex-1">
+        <input
+          ref={inputRef}
+          type="text"
+          inputMode={allowDecimal ? 'decimal' : 'numeric'}
+          // Pattern hints iOS to show the dot on the numeric pad
+          pattern={allowDecimal ? '[0-9]*[.,]?[0-9]*' : '[0-9]*'}
+          enterKeyHint="done"
+          value={display}
+          onChange={handleChange}
+          onFocus={handleFocus}
+          onBlur={handleBlur}
+          onKeyDown={handleKey}
+          autoComplete="off"
+          autoCorrect="off"
+          spellCheck="false"
+          className={`w-full bg-neutral-900 border border-neutral-800 rounded-lg text-center text-white font-mono font-bold px-6 ${large ? 'text-2xl py-2' : 'text-lg py-1.5'} focus:outline-none focus:border-orange-500`}
+        />
+        {showClear && (
+          <button
+            type="button"
+            onMouseDown={(e) => e.preventDefault()} // don't steal focus from input
+            onClick={() => {
+              setDraft('');
+              inputRef.current?.focus();
+            }}
+            className="absolute right-1 top-1/2 -translate-y-1/2 w-7 h-7 rounded-full bg-neutral-700 hover:bg-neutral-600 text-neutral-300 flex items-center justify-center"
+            aria-label="Clear"
+          >
+            <X size={12} strokeWidth={3} />
+          </button>
+        )}
+      </div>
       <button
+        type="button"
         onClick={inc}
         className="w-10 flex-shrink-0 bg-neutral-800 hover:bg-neutral-700 active:bg-neutral-600 rounded-lg flex items-center justify-center text-neutral-300"
+        aria-label="Increase"
       >
         <Plus size={18} strokeWidth={2.5} />
       </button>
@@ -683,12 +825,20 @@ function GhostButton({ children, onClick, icon: Icon, danger = false, className 
 // ============================================================
 // HOME SCREEN
 // ============================================================
-function HomeScreen({ history, onStart, onOpenExercise, settings, install, onShowInstall }) {
+function HomeScreen({
+  history, onStart, onOpenExercise, settings, install, online, onShowInstall,
+  pausedWorkouts, onResumePaused, onDiscardPaused,
+}) {
   const streak = useMemo(() => calcWeeklyStreak(history), [history]);
-  const lastWorkout = history[history.length - 1];
+  // "Last workout" means most recent COMPLETED. Paused workouts surface
+  // separately so we don't confuse the user about what they accomplished.
+  const lastWorkout = useMemo(() => {
+    const completed = history.filter(w => w.status === 'completed' || w.status === undefined);
+    return completed[completed.length - 1];
+  }, [history]);
 
-  // Show install hint once per device unless dismissed. We don't pester desktop
-  // users — the value of installing is much higher on phones.
+  // Show install hint once per device unless dismissed. We don't pester
+  // desktop users — the value of installing is much higher on phones.
   const [installDismissed, setInstallDismissed] = useState(() => {
     try { return localStorage.getItem('hypercoach:install-dismissed') === '1'; } catch { return false; }
   });
@@ -703,14 +853,19 @@ function HomeScreen({ history, onStart, onOpenExercise, settings, install, onSho
   const recentExercises = useMemo(() => {
     const seen = new Set();
     const list = [];
-    [...history].reverse().forEach(w => {
-      w.exercises.forEach(e => {
-        if (!seen.has(e.name)) {
-          seen.add(e.name);
-          list.push(e.name);
-        }
+    // Only suggest from completed sessions — paused/discarded clutter is
+    // confusing.
+    [...history]
+      .filter(w => w.status === 'completed' || w.status === undefined)
+      .reverse()
+      .forEach(w => {
+        w.exercises.forEach(e => {
+          if (!seen.has(e.name)) {
+            seen.add(e.name);
+            list.push(e.name);
+          }
+        });
       });
-    });
     return list.slice(0, 6);
   }, [history]);
 
@@ -720,7 +875,7 @@ function HomeScreen({ history, onStart, onOpenExercise, settings, install, onSho
   const weeklyVolume = useMemo(() => {
     const weekAgo = Date.now() - 7 * 86400000;
     return history
-      .filter(w => w.startedAt >= weekAgo)
+      .filter(w => (w.status === 'completed' || w.status === undefined) && w.startedAt >= weekAgo)
       .flatMap(w => w.exercises.flatMap(e => e.sets.filter(s => s.type === 'working')))
       .reduce((sum, s) => sum + s.weight * s.reps, 0);
   }, [history]);
@@ -742,7 +897,7 @@ function HomeScreen({ history, onStart, onOpenExercise, settings, install, onSho
             <Smartphone size={20} className="text-orange-500 flex-shrink-0" />
             <div className="flex-1 min-w-0">
               <div className="text-xs uppercase tracking-widest text-orange-400 font-bold">Install for full-screen</div>
-              <div className="text-[11px] text-neutral-400 mt-0.5">Add to home screen — works offline.</div>
+              <div className="text-[11px] text-neutral-400 mt-0.5">Add to home screen — works fully offline.</div>
             </div>
             <button
               onClick={onShowInstall}
@@ -782,6 +937,47 @@ function HomeScreen({ history, onStart, onOpenExercise, settings, install, onSho
           </div>
         </div>
       </div>
+
+      {/* Resume paused workout(s) */}
+      {pausedWorkouts && pausedWorkouts.length > 0 && (
+        <div className="px-5 mb-6">
+          <div className="text-[10px] uppercase tracking-widest text-amber-400 mb-2 px-1 flex items-center gap-1.5">
+            <Pause size={11} /> Paused — Resume Workout
+          </div>
+          <div className="space-y-2">
+            {pausedWorkouts.map(pw => {
+              const setCount = pw.exercises.reduce(
+                (s, e) => s + e.sets.filter(x => x.type === 'working').length, 0
+              );
+              return (
+                <div key={pw.id} className="bg-gradient-to-br from-amber-500/10 to-neutral-900 border border-amber-500/30 rounded-xl p-3 flex items-center gap-3">
+                  <button
+                    onClick={() => onResumePaused(pw.id)}
+                    className="flex-1 flex items-center gap-3 text-left min-w-0"
+                  >
+                    <PlayCircle size={28} className="text-amber-400 flex-shrink-0" />
+                    <div className="min-w-0">
+                      <div className="text-sm text-white truncate">
+                        {pw.exercises.map(e => e.name).join(' · ') || 'Empty workout'}
+                      </div>
+                      <div className="text-[10px] uppercase tracking-widest text-neutral-500 mt-0.5">
+                        Paused {fmtRelativeDate(pw.startedAt)} · {setCount} sets logged
+                      </div>
+                    </div>
+                  </button>
+                  <button
+                    onClick={() => onDiscardPaused(pw.id)}
+                    aria-label="Discard paused workout"
+                    className="flex-shrink-0 text-neutral-600 hover:text-red-400 p-2"
+                  >
+                    <Trash2 size={14} />
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
 
       {/* Start CTA */}
       <div className="px-5 mb-6">
@@ -1105,7 +1301,7 @@ function RecommendationCard({ rec, settings }) {
 // ============================================================
 function WorkoutScreen({
   workout, activeExerciseIdx, history, settings,
-  onLogSet, onDeleteSet, onAddExercise, onFinishExercise, onFinishWorkout, onBack,
+  onLogSet, onDeleteSet, onAddExercise, onFinishExercise, onFinishWorkout, onDiscardWorkout, onBack,
 }) {
   const exercise = workout.exercises[activeExerciseIdx];
 
@@ -1124,7 +1320,10 @@ function WorkoutScreen({
   const warmupRec = useMemo(() => {
     if (!workingRec || workingRec.weight === null) return null;
     if (lastWorkingSet) return null;
-    const w = roundIncrement(workingRec.weight * 0.5, settings.increment);
+    const profile = profileForExercise(exercise.name, settings);
+    // Snap warmup DOWN — never warm up with more weight than the formula
+    // suggested, even if rounding could go either way.
+    const w = roundToAvailable(workingRec.weight * 0.5, profile, 'down');
     return {
       weight: w,
       repRange: [5, 8],
@@ -1133,7 +1332,7 @@ function WorkoutScreen({
       e1rm: 0,
       tag: 'warmup',
     };
-  }, [workingRec, lastWorkingSet, settings]);
+  }, [workingRec, lastWorkingSet, settings, exercise.name]);
 
   const warmupAvailable = !!warmupRec;
   const isRescueStop = workingRec.tag === 'rescue-stop';
@@ -1173,17 +1372,26 @@ function WorkoutScreen({
   }, [lastRecKey, recommendation, exercise.sets.length, setType]);
 
   const handleSave = () => {
-    if (weight <= 0 || reps <= 0) return;
-    onLogSet({
-      weight,
-      reps,
-      // Warm-ups are never "to failure" and never have form judged for the recommendation engine
-      failure: setType === 'warmup' ? false : failure,
-      form: setType === 'warmup' ? 'good' : form,
-      type: setType,
-      notes: notes.trim() || undefined,
-      timestamp: Date.now(),
-    });
+    // Commit any in-flight input edits before reading state. Tapping Save
+    // while a Stepper input still has draft text means React hasn't yet
+    // received the blur event — force it so the draft becomes the parent
+    // value before we read `weight` and `reps`.
+    if (typeof document !== 'undefined' && document.activeElement?.blur) {
+      document.activeElement.blur();
+    }
+    // Defer one tick so state updates from blur land first.
+    setTimeout(() => {
+      if (weight <= 0 || reps <= 0) return;
+      onLogSet({
+        weight,
+        reps,
+        failure: setType === 'warmup' ? false : failure,
+        form: setType === 'warmup' ? 'good' : form,
+        type: setType,
+        notes: notes.trim() || undefined,
+        timestamp: Date.now(),
+      });
+    }, 0);
   };
 
   const previousSession = useMemo(() => {
@@ -1312,7 +1520,7 @@ function WorkoutScreen({
           </div>
           <div>
             <div className="text-[10px] uppercase tracking-widest text-neutral-500 mb-1.5 px-1">Reps</div>
-            <Stepper value={reps} onChange={v => setReps(Math.round(v))} step={1} min={1} max={100} large />
+            <Stepper value={reps} onChange={v => setReps(Math.round(v))} step={1} min={1} max={100} large allowDecimal={false} />
           </div>
         </div>
 
@@ -1393,6 +1601,12 @@ function WorkoutScreen({
             Finish Workout
           </GhostButton>
         </div>
+        <button
+          onClick={onDiscardWorkout}
+          className="w-full mt-2 text-xs text-neutral-600 hover:text-red-400 py-2"
+        >
+          Discard workout
+        </button>
       </div>
     </div>
   );
@@ -1564,7 +1778,7 @@ function SummaryScreen({ workout, history, settings, onDone }) {
 // ============================================================
 // HISTORY SCREEN
 // ============================================================
-function HistoryScreen({ history, settings, onDeleteWorkout }) {
+function HistoryScreen({ history, settings, onDeleteWorkout, onEditWorkout }) {
   const [selectedExercise, setSelectedExercise] = useState(null);
 
   const allExerciseNames = useMemo(() => {
@@ -1620,33 +1834,53 @@ function HistoryScreen({ history, settings, onDeleteWorkout }) {
 
           <div className="text-[10px] uppercase tracking-widest text-neutral-500 mb-2 px-1">Sessions</div>
           <div className="space-y-2">
-            {[...history].reverse().map(w => {
-              const workingSets = w.exercises.flatMap(e => e.sets.filter(s => s.type === 'working'));
-              const totalSets = workingSets.length;
-              const totalVol = workingSets.reduce((s, x) => s + x.weight * x.reps, 0);
-              return (
-                <div key={w.id} className="bg-neutral-900 border border-neutral-800 rounded-lg p-3">
-                  <div className="flex items-start justify-between mb-2 gap-2">
-                    <div className="text-sm text-white">{new Date(w.startedAt).toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' })}</div>
-                    <div className="flex items-center gap-1 flex-shrink-0">
-                      <div className="text-[10px] uppercase tracking-widest font-mono text-neutral-500">
+            {[...history]
+              .filter(w => w.status === 'completed' || w.status === undefined)
+              .reverse()
+              .map(w => {
+                const workingSets = w.exercises.flatMap(e => e.sets.filter(s => s.type === 'working'));
+                const totalSets = workingSets.length;
+                const totalVol = workingSets.reduce((s, x) => s + x.weight * x.reps, 0);
+                return (
+                  <div key={w.id} className="bg-neutral-900 border border-neutral-800 rounded-lg p-3 flex items-stretch gap-2">
+                    <button
+                      onClick={() => onEditWorkout(w)}
+                      className="flex-1 min-w-0 text-left"
+                    >
+                      <div className="flex items-center gap-2 mb-1.5">
+                        <div className="text-sm text-white">{new Date(w.startedAt).toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' })}</div>
+                        {w.edited && (
+                          <span className="text-[9px] uppercase tracking-widest text-amber-400 bg-amber-500/10 border border-amber-500/30 rounded px-1.5 py-0.5 font-bold">
+                            Edited
+                          </span>
+                        )}
+                      </div>
+                      <div className="text-xs text-neutral-400 truncate">
+                        {w.exercises.map(e => e.name).join(' · ')}
+                      </div>
+                      <div className="text-[10px] uppercase tracking-widest font-mono text-neutral-500 mt-1">
                         {totalSets} sets · {fmt(Math.round(totalVol))}{settings.unit}
                       </div>
+                    </button>
+                    <div className="flex flex-col gap-1">
+                      <button
+                        onClick={() => onEditWorkout(w)}
+                        aria-label="Edit workout"
+                        className="p-1.5 text-neutral-500 hover:text-orange-400"
+                      >
+                        <Edit3 size={14} />
+                      </button>
                       <button
                         onClick={() => onDeleteWorkout(w)}
                         aria-label="Delete workout"
-                        className="p-1.5 -mr-1 text-neutral-600 hover:text-red-400 active:text-red-500"
+                        className="p-1.5 text-neutral-600 hover:text-red-400"
                       >
                         <Trash2 size={14} />
                       </button>
                     </div>
                   </div>
-                  <div className="text-xs text-neutral-400">
-                    {w.exercises.map(e => e.name).join(' · ')}
-                  </div>
-                </div>
-              );
-            })}
+                );
+              })}
           </div>
         </div>
       )}
@@ -1788,10 +2022,814 @@ function E1RMChart({ sessions, unit }) {
 }
 
 // ============================================================
-// SETTINGS SCREEN
+// EDIT COMPLETED WORKOUT SCREEN
 // ============================================================
-function SettingsScreen({ settings, onChange, history, onReset, onExport, install, onShowInstall }) {
+//
+// Lets the user retroactively fix a logged workout — typos in weight,
+// missed sets, wrong rep counts, missing exercises, etc.
+//
+// We hold the in-progress edits in local state so the user can experiment
+// freely without polluting history. Only on Save do we commit, and we set
+// `edited: true` + `editedAt` so the History list can badge it. All the
+// downstream consequences (e1RM PRs, progression targets, next-workout
+// recommendations) recompute automatically because they derive from
+// history — no cache invalidation needed.
+function EditWorkoutScreen({ workout, settings, onSave, onBack }) {
+  // Deep-clone so edits don't mutate the original until Save.
+  const [draft, setDraft] = useState(() => JSON.parse(JSON.stringify(workout)));
+  // Which set is currently being edited inline: { exIdx, setIdx } or null
+  const [editing, setEditing] = useState(null);
+  // Whether to show the "Add Exercise" inline picker
+  const [addingExercise, setAddingExercise] = useState(false);
+  // Whether a particular exercise's name is being renamed inline
+  const [renamingIdx, setRenamingIdx] = useState(null);
+
+  // Compare draft to original to decide whether to set `edited` on save.
+  const isDirty = useMemo(
+    () => JSON.stringify(draft) !== JSON.stringify(workout),
+    [draft, workout]
+  );
+
+  const updateSet = (exIdx, setIdx, patch) => {
+    const exs = [...draft.exercises];
+    const sets = [...exs[exIdx].sets];
+    sets[setIdx] = { ...sets[setIdx], ...patch };
+    exs[exIdx] = { ...exs[exIdx], sets };
+    setDraft({ ...draft, exercises: exs });
+  };
+
+  const deleteSetAt = (exIdx, setIdx) => {
+    const exs = [...draft.exercises];
+    exs[exIdx] = {
+      ...exs[exIdx],
+      sets: exs[exIdx].sets.filter((_, i) => i !== setIdx),
+    };
+    setDraft({ ...draft, exercises: exs });
+    if (editing?.exIdx === exIdx && editing?.setIdx === setIdx) setEditing(null);
+  };
+
+  const addSet = (exIdx) => {
+    // Default new set: copy the last working set if any, else sensible defaults.
+    const ex = draft.exercises[exIdx];
+    const lastWorking = [...ex.sets].reverse().find(s => s.type === 'working');
+    const newSet = lastWorking
+      ? { ...lastWorking, timestamp: Date.now() }
+      : {
+          weight: 20, reps: 8, failure: true, form: 'good',
+          type: 'working', timestamp: Date.now(),
+        };
+    const exs = [...draft.exercises];
+    exs[exIdx] = { ...ex, sets: [...ex.sets, newSet] };
+    setDraft({ ...draft, exercises: exs });
+    // Auto-open the editor for the new row
+    setEditing({ exIdx, setIdx: exs[exIdx].sets.length - 1 });
+  };
+
+  const renameExercise = (exIdx, newName) => {
+    const trimmed = newName.trim();
+    if (!trimmed) return;
+    const exs = [...draft.exercises];
+    exs[exIdx] = { ...exs[exIdx], name: trimmed };
+    setDraft({ ...draft, exercises: exs });
+    setRenamingIdx(null);
+  };
+
+  const deleteExercise = (exIdx) => {
+    const exs = draft.exercises.filter((_, i) => i !== exIdx);
+    setDraft({ ...draft, exercises: exs });
+  };
+
+  const addExercise = (name) => {
+    setDraft({
+      ...draft,
+      exercises: [...draft.exercises, { name, sets: [] }],
+    });
+    setAddingExercise(false);
+  };
+
+  const handleSave = () => {
+    if (typeof document !== 'undefined' && document.activeElement?.blur) {
+      document.activeElement.blur();
+    }
+    setTimeout(() => {
+      // Drop exercises with zero sets — they're meaningless artifacts of
+      // mid-edit state.
+      const cleaned = {
+        ...draft,
+        exercises: draft.exercises.filter(e => e.sets.length > 0),
+      };
+      if (isDirty) {
+        cleaned.edited = true;
+        cleaned.editedAt = Date.now();
+      }
+      onSave(cleaned);
+    }, 0);
+  };
+
+  return (
+    <div className="pb-32 slide-up">
+      <TopBar
+        title="Edit Workout"
+        onBack={onBack}
+        subtitle={new Date(workout.startedAt).toLocaleDateString(undefined, {
+          weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit',
+        })}
+        right={
+          <button
+            onClick={handleSave}
+            disabled={!isDirty}
+            className={`text-[10px] uppercase tracking-widest font-bold px-2 ${isDirty ? 'text-orange-500' : 'text-neutral-700'}`}
+          >
+            Save
+          </button>
+        }
+      />
+
+      {isDirty && (
+        <div className="mx-4 mt-4 px-3 py-2 bg-amber-500/10 border border-amber-500/30 rounded-lg flex items-start gap-2">
+          <AlertTriangle size={14} className="text-amber-400 mt-0.5 flex-shrink-0" />
+          <div className="text-xs text-amber-200 leading-relaxed">
+            Unsaved changes. After saving, PRs, e1RM, and next-workout
+            recommendations will recalculate using your edits.
+          </div>
+        </div>
+      )}
+
+      <div className="px-4 pt-4 space-y-5">
+        {draft.exercises.map((ex, exIdx) => (
+          <div key={exIdx} className="bg-neutral-900 border border-neutral-800 rounded-xl p-3">
+            {/* Exercise header — name + rename + delete */}
+            <div className="flex items-center gap-2 mb-3">
+              {renamingIdx === exIdx ? (
+                <input
+                  type="text"
+                  defaultValue={ex.name}
+                  autoFocus
+                  onBlur={(e) => renameExercise(exIdx, e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') e.target.blur();
+                    if (e.key === 'Escape') setRenamingIdx(null);
+                  }}
+                  className="flex-1 bg-neutral-800 border border-orange-500 rounded px-2 py-1 text-white text-sm"
+                />
+              ) : (
+                <button
+                  onClick={() => setRenamingIdx(exIdx)}
+                  className="flex-1 text-left text-white font-medium text-base truncate"
+                >
+                  {ex.name}
+                </button>
+              )}
+              <button
+                onClick={() => setRenamingIdx(renamingIdx === exIdx ? null : exIdx)}
+                aria-label="Rename exercise"
+                className="text-neutral-500 hover:text-orange-400 p-1"
+              >
+                <Edit3 size={14} />
+              </button>
+              <button
+                onClick={() => deleteExercise(exIdx)}
+                aria-label="Delete exercise"
+                className="text-neutral-600 hover:text-red-400 p-1"
+              >
+                <Trash2 size={14} />
+              </button>
+            </div>
+
+            {/* Sets list — tap to edit inline */}
+            <div className="space-y-1.5">
+              {ex.sets.map((s, setIdx) => {
+                const isOpen = editing?.exIdx === exIdx && editing?.setIdx === setIdx;
+                const isWarmup = s.type === 'warmup';
+                const label = isWarmup
+                  ? 'Warm'
+                  : `Set ${ex.sets.slice(0, setIdx + 1).filter(x => x.type === 'working').length}`;
+                return (
+                  <div key={setIdx} className="bg-neutral-950 border border-neutral-800 rounded-lg overflow-hidden">
+                    {!isOpen ? (
+                      <button
+                        onClick={() => setEditing({ exIdx, setIdx })}
+                        className="w-full px-3 py-2 flex items-center gap-3 text-left"
+                      >
+                        <div className="text-[10px] uppercase tracking-widest text-neutral-500 w-12 font-bold flex-shrink-0">
+                          {label}
+                        </div>
+                        <div className="flex-1 font-mono">
+                          <span className="text-white font-bold">{s.weight}{settings.unit}</span>
+                          <span className="text-neutral-600 mx-2">×</span>
+                          <span className="text-white font-bold">{s.reps}</span>
+                        </div>
+                        <div className="flex items-center gap-1.5 flex-shrink-0">
+                          {!isWarmup && s.failure && <span className="text-[9px] uppercase tracking-widest text-red-400 font-bold">F</span>}
+                          {!isWarmup && (
+                            <span className={`text-[9px] uppercase tracking-widest font-bold ${
+                              s.form === 'good' ? 'text-lime-400' : s.form === 'okay' ? 'text-yellow-400' : 'text-red-400'
+                            }`}>{s.form?.[0] ?? '?'}</span>
+                          )}
+                          <Edit3 size={12} className="text-neutral-600 ml-1" />
+                        </div>
+                      </button>
+                    ) : (
+                      <InlineSetEditor
+                        set={s}
+                        settings={settings}
+                        onChange={(patch) => updateSet(exIdx, setIdx, patch)}
+                        onDelete={() => deleteSetAt(exIdx, setIdx)}
+                        onClose={() => setEditing(null)}
+                      />
+                    )}
+                  </div>
+                );
+              })}
+
+              <button
+                onClick={() => addSet(exIdx)}
+                className="w-full border border-dashed border-neutral-700 hover:border-orange-500/50 hover:bg-neutral-800/50 rounded-lg py-2 text-xs text-neutral-400 hover:text-orange-400 flex items-center justify-center gap-1.5"
+              >
+                <Plus size={12} /> Add Set
+              </button>
+            </div>
+          </div>
+        ))}
+
+        {/* Add Exercise */}
+        {!addingExercise ? (
+          <button
+            onClick={() => setAddingExercise(true)}
+            className="w-full border-2 border-dashed border-neutral-700 hover:border-orange-500/50 hover:bg-neutral-900 rounded-xl py-4 text-neutral-400 hover:text-orange-400 flex items-center justify-center gap-2 text-sm uppercase tracking-widest font-bold"
+          >
+            <Plus size={16} /> Add Exercise
+          </button>
+        ) : (
+          <AddExerciseInline
+            onCommit={addExercise}
+            onCancel={() => setAddingExercise(false)}
+          />
+        )}
+
+        <div className="pt-2 space-y-2">
+          <PrimaryButton onClick={handleSave} disabled={!isDirty} icon={Save}>
+            {isDirty ? 'Save Changes' : 'No Changes'}
+          </PrimaryButton>
+          <GhostButton onClick={onBack}>Cancel</GhostButton>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Inline form for editing a single set. Shows all the same controls as the
+// live workout screen but operates on a draft set.
+function InlineSetEditor({ set, settings, onChange, onDelete, onClose }) {
+  const [weight, setWeight] = useState(set.weight);
+  const [reps, setReps] = useState(set.reps);
+  const [failure, setFailure] = useState(!!set.failure);
+  const [form, setForm] = useState(set.form || 'good');
+  const [notes, setNotes] = useState(set.notes || '');
+  const [type, setType] = useState(set.type || 'working');
+
+  // Flush back on any change — the parent holds the draft, we just edit it.
+  // We sync on blur of inputs (via commit in Stepper) and on every toggle.
+  useEffect(() => {
+    onChange({
+      weight, reps,
+      failure: type === 'warmup' ? false : failure,
+      form: type === 'warmup' ? 'good' : form,
+      type,
+      notes: notes.trim() || undefined,
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [weight, reps, failure, form, notes, type]);
+
+  return (
+    <div className="p-3 bg-neutral-900 border-t border-orange-500/40">
+      <div className="flex gap-2 mb-3">
+        <button
+          onClick={() => setType('warmup')}
+          className={`flex-1 py-1.5 rounded text-[10px] uppercase tracking-widest font-bold border ${type === 'warmup' ? 'bg-neutral-700 text-white border-neutral-600' : 'bg-transparent text-neutral-500 border-neutral-800'}`}
+        >Warm-up</button>
+        <button
+          onClick={() => setType('working')}
+          className={`flex-1 py-1.5 rounded text-[10px] uppercase tracking-widest font-bold border ${type === 'working' ? 'bg-orange-500 text-black border-orange-500' : 'bg-transparent text-neutral-500 border-neutral-800'}`}
+        >Working</button>
+      </div>
+
+      <div className="grid grid-cols-2 gap-2 mb-3">
+        <div>
+          <div className="text-[9px] uppercase tracking-widest text-neutral-500 mb-1 px-1">Weight ({settings.unit})</div>
+          <Stepper value={weight} onChange={setWeight} step={settings.increment} min={0} max={9999} />
+        </div>
+        <div>
+          <div className="text-[9px] uppercase tracking-widest text-neutral-500 mb-1 px-1">Reps</div>
+          <Stepper value={reps} onChange={v => setReps(Math.round(v))} step={1} min={1} max={100} allowDecimal={false} />
+        </div>
+      </div>
+
+      {type === 'working' && (
+        <>
+          <div className="flex gap-1.5 mb-2">
+            <Pill active={failure} onClick={() => setFailure(true)} color="orange">Fail</Pill>
+            <Pill active={!failure} onClick={() => setFailure(false)} color="orange">No Fail</Pill>
+          </div>
+          <div className="flex gap-1.5 mb-2">
+            <Pill active={form === 'good'} onClick={() => setForm('good')} color="lime">Good</Pill>
+            <Pill active={form === 'okay'} onClick={() => setForm('okay')} color="yellow">Okay</Pill>
+            <Pill active={form === 'bad'} onClick={() => setForm('bad')} color="red">Bad</Pill>
+          </div>
+        </>
+      )}
+
+      <textarea
+        value={notes}
+        onChange={e => setNotes(e.target.value)}
+        placeholder="Notes (optional)"
+        rows={1}
+        className="w-full bg-neutral-950 border border-neutral-800 rounded px-2 py-1.5 text-xs text-white placeholder:text-neutral-600 focus:outline-none focus:border-orange-500 mb-2"
+      />
+
+      <div className="flex gap-2">
+        <button
+          onClick={onDelete}
+          className="flex-1 text-xs text-red-400 hover:bg-red-950 border border-red-900 rounded py-1.5 uppercase tracking-widest font-bold flex items-center justify-center gap-1"
+        >
+          <Trash2 size={12} /> Delete
+        </button>
+        <button
+          onClick={onClose}
+          className="flex-1 text-xs text-neutral-300 bg-neutral-800 hover:bg-neutral-700 rounded py-1.5 uppercase tracking-widest font-bold"
+        >
+          Done
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// Compact picker for adding a new exercise during edit. Same search UX as
+// the dedicated select screen but inline.
+function AddExerciseInline({ onCommit, onCancel }) {
+  const [query, setQuery] = useState('');
+  const matches = useMemo(() => {
+    const q = query.toLowerCase().trim();
+    if (!q) return COMMON_EXERCISES.slice(0, 8);
+    return COMMON_EXERCISES.filter(e => e.name.toLowerCase().includes(q)).slice(0, 8);
+  }, [query]);
+
+  return (
+    <div className="bg-neutral-900 border border-neutral-800 rounded-xl p-3">
+      <div className="flex items-center gap-2 mb-2">
+        <Search size={14} className="text-neutral-500 flex-shrink-0" />
+        <input
+          type="text"
+          value={query}
+          autoFocus
+          placeholder="Type exercise name..."
+          onChange={e => setQuery(e.target.value)}
+          onKeyDown={e => {
+            if (e.key === 'Enter' && query.trim()) onCommit(query.trim());
+            if (e.key === 'Escape') onCancel();
+          }}
+          className="flex-1 bg-transparent text-white text-sm focus:outline-none"
+        />
+        <button
+          onClick={onCancel}
+          aria-label="Cancel"
+          className="text-neutral-500 hover:text-white p-1"
+        >
+          <X size={14} />
+        </button>
+      </div>
+      <div className="space-y-1">
+        {matches.map(e => (
+          <button
+            key={e.name}
+            onClick={() => onCommit(e.name)}
+            className="w-full bg-neutral-950 hover:bg-neutral-800 border border-neutral-800 rounded px-3 py-2 text-left text-sm text-white"
+          >
+            {e.name}
+          </button>
+        ))}
+        {query.trim() && !matches.some(m => m.name.toLowerCase() === query.toLowerCase()) && (
+          <button
+            onClick={() => onCommit(query.trim())}
+            className="w-full border-2 border-dashed border-orange-500/40 hover:border-orange-500 rounded px-3 py-2 text-left text-sm text-orange-400"
+          >
+            + Add custom: {query.trim()}
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+
+// ============================================================
+// LOADING PROFILE EDITOR
+// ============================================================
+//
+// Edits one loading profile — either the global default or a per-exercise
+// override. All 5 profile types share the same scaffold (TopBar, save/back,
+// preview strip) but the middle config block changes based on the picked
+// type.
+
+function ProfileEditorScreen({ title, profile, unit, isOverride, onSave, onResetToDefault, onBack }) {
+  const [draft, setDraft] = useState(() => ({ ...DEFAULT_PROFILE, ...profile }));
+  const setField = (k, v) => setDraft(d => ({ ...d, [k]: v }));
+  const setType = (type) => {
+    // When switching type, preserve common fields (min/max) but reset
+    // type-specific config to sensible defaults.
+    const base = { type, min: draft.min ?? 0, max: draft.max ?? 500 };
+    if (type === 'fixed') base.increment = draft.increment ?? 2.5;
+    if (type === 'dumbbell') base.increment = draft.increment ?? 2;
+    if (type === 'plate') {
+      base.barWeight = draft.barWeight ?? 20;
+      base.plates = draft.plates ?? [
+        { weight: 1.25, count: 4 },
+        { weight: 2.5, count: 4 },
+        { weight: 5, count: 4 },
+        { weight: 10, count: 4 },
+        { weight: 20, count: 4 },
+      ];
+    }
+    if (type === 'stack' || type === 'custom') {
+      base.weights = draft.weights ?? [];
+    }
+    setDraft(base);
+  };
+
+  // Live preview — show the first N available weights so the user can
+  // sanity-check the config.
+  const preview = useMemo(() => {
+    try {
+      return availableWeights(draft);
+    } catch {
+      return [];
+    }
+  }, [draft]);
+
+  const handleSave = () => {
+    if (typeof document !== 'undefined' && document.activeElement?.blur) {
+      document.activeElement.blur();
+    }
+    setTimeout(() => {
+      const clean = { ...draft };
+      if (clean.type === 'stack' || clean.type === 'custom') {
+        clean.weights = (clean.weights || [])
+          .map(Number)
+          .filter(w => Number.isFinite(w) && w > 0)
+          .sort((a, b) => a - b);
+        clean.weights = Array.from(new Set(clean.weights));
+      }
+      if (clean.type === 'plate') {
+        clean.plates = (clean.plates || []).filter(p => p.weight > 0 && p.count > 0);
+      }
+      onSave(clean);
+    }, 0);
+  };
+
+  return (
+    <div className="pb-32 slide-up">
+      <TopBar
+        title={title}
+        onBack={onBack}
+        subtitle={isOverride ? 'Custom override' : 'Global default'}
+        right={
+          <button onClick={handleSave} className="text-[10px] uppercase tracking-widest text-orange-500 font-bold px-2">
+            Save
+          </button>
+        }
+      />
+
+      <div className="px-4 pt-4 space-y-5">
+        {/* Type picker */}
+        <Section label="Equipment Type">
+          <div className="grid grid-cols-3 gap-2">
+            {PROFILE_TYPES.map(t => (
+              <button
+                key={t}
+                onClick={() => setType(t)}
+                className={`py-2.5 rounded-lg text-xs uppercase tracking-widest font-bold border ${
+                  draft.type === t
+                    ? 'bg-orange-500 text-black border-orange-500'
+                    : 'bg-transparent text-neutral-400 border-neutral-800'
+                }`}
+              >
+                {t}
+              </button>
+            ))}
+          </div>
+          <div className="text-[10px] text-neutral-500 mt-2 px-1 leading-relaxed">
+            {profileTypeHelp(draft.type)}
+          </div>
+        </Section>
+
+        {/* Type-specific config */}
+        {draft.type === 'fixed' && (
+          <Section label="Increment">
+            <Stepper value={draft.increment ?? 2.5} onChange={v => setField('increment', v)} step={0.25} min={0.25} max={50} />
+          </Section>
+        )}
+
+        {draft.type === 'dumbbell' && (
+          <Section label="Dumbbell Step">
+            <Stepper value={draft.increment ?? 2} onChange={v => setField('increment', v)} step={0.5} min={0.5} max={20} />
+            <div className="text-[10px] text-neutral-500 mt-2 px-1">
+              Each dumbbell weight available (e.g. 2 means dumbbells exist as 2, 4, 6, 8, 10 …).
+            </div>
+          </Section>
+        )}
+
+        {draft.type === 'plate' && (
+          <PlateEditor
+            bar={draft.barWeight ?? 20}
+            plates={draft.plates ?? []}
+            unit={unit}
+            onChange={(bar, plates) => setDraft(d => ({ ...d, barWeight: bar, plates }))}
+          />
+        )}
+
+        {(draft.type === 'stack' || draft.type === 'custom') && (
+          <CustomWeightsEditor
+            weights={draft.weights ?? []}
+            unit={unit}
+            onChange={(weights) => setField('weights', weights)}
+            hint={draft.type === 'stack'
+              ? 'Enter each pin position on the machine stack. The app will only recommend these weights.'
+              : 'Enter every available weight. Decimals like 1.2 or 3.7 are fine.'}
+          />
+        )}
+
+        <Section label="Range Limits">
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <div className="text-[10px] uppercase tracking-widest text-neutral-500 mb-1.5 px-1">Min ({unit})</div>
+              <Stepper value={draft.min ?? 0} onChange={v => setField('min', v)} step={1} min={0} max={1000} />
+            </div>
+            <div>
+              <div className="text-[10px] uppercase tracking-widest text-neutral-500 mb-1.5 px-1">Max ({unit})</div>
+              <Stepper value={draft.max ?? 500} onChange={v => setField('max', v)} step={5} min={1} max={2000} />
+            </div>
+          </div>
+        </Section>
+
+        {/* Preview */}
+        <Section label={`Available Weights · ${preview.length} positions`}>
+          {preview.length === 0 ? (
+            <div className="text-xs text-neutral-500 italic px-1">
+              No weights configured yet. Add some above to see the preview.
+            </div>
+          ) : (
+            <div className="bg-neutral-900 border border-neutral-800 rounded-lg p-3 flex flex-wrap gap-1.5">
+              {preview.slice(0, 24).map((w, i) => (
+                <span key={i} className="font-mono text-xs text-neutral-300 bg-neutral-800 rounded px-2 py-0.5">
+                  {fmt(w)}{unit}
+                </span>
+              ))}
+              {preview.length > 24 && (
+                <span className="font-mono text-xs text-neutral-500 px-2 py-0.5">
+                  +{preview.length - 24} more
+                </span>
+              )}
+            </div>
+          )}
+        </Section>
+
+        <div className="pt-2 space-y-2">
+          <PrimaryButton onClick={handleSave} icon={Save}>Save Profile</PrimaryButton>
+          {onResetToDefault && (
+            <GhostButton onClick={onResetToDefault} icon={RotateCcw}>
+              Use Default Instead
+            </GhostButton>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function profileTypeHelp(type) {
+  switch (type) {
+    case 'fixed':
+      return 'Linear weight increments — most common for plate-loaded barbells with a standard plate set.';
+    case 'dumbbell':
+      return 'For exercises using dumbbells. Dumbbells come in fixed jumps (commonly 2kg or 5lb steps).';
+    case 'plate':
+      return 'Configure the bar weight and which plates you have. The app generates every reachable total.';
+    case 'stack':
+      return 'For machine stacks. Enter each available pin position.';
+    case 'custom':
+      return 'For unusual machines (Matrix, certain pin-loaded systems) with non-linear weight options including decimals.';
+    default:
+      return '';
+  }
+}
+
+function PlateEditor({ bar, plates, unit, onChange }) {
+  const updateBar = (v) => onChange(v, plates);
+  const updatePlate = (idx, patch) => {
+    const next = plates.map((p, i) => i === idx ? { ...p, ...patch } : p);
+    onChange(bar, next);
+  };
+  const removePlate = (idx) => onChange(bar, plates.filter((_, i) => i !== idx));
+  const addPlate = () => onChange(bar, [...plates, { weight: 1, count: 2 }]);
+
+  return (
+    <>
+      <Section label="Bar Weight">
+        <Stepper value={bar} onChange={updateBar} step={0.5} min={0} max={50} />
+      </Section>
+      <Section label="Plates (per side)">
+        <div className="space-y-2">
+          {plates.map((p, i) => (
+            <div key={i} className="bg-neutral-900 border border-neutral-800 rounded-lg p-2.5 flex items-center gap-2">
+              <div className="flex-1">
+                <div className="text-[9px] uppercase tracking-widest text-neutral-500 mb-1">Weight ({unit})</div>
+                <Stepper
+                  value={p.weight}
+                  onChange={v => updatePlate(i, { weight: v })}
+                  step={0.25} min={0.25} max={50}
+                />
+              </div>
+              <div className="flex-1">
+                <div className="text-[9px] uppercase tracking-widest text-neutral-500 mb-1">Per side</div>
+                <Stepper
+                  value={p.count}
+                  onChange={v => updatePlate(i, { count: Math.round(v) })}
+                  step={1} min={0} max={20}
+                  allowDecimal={false}
+                />
+              </div>
+              <button
+                onClick={() => removePlate(i)}
+                aria-label="Remove plate"
+                className="self-end text-neutral-600 hover:text-red-400 p-2"
+              >
+                <Trash2 size={14} />
+              </button>
+            </div>
+          ))}
+          <button
+            onClick={addPlate}
+            className="w-full border border-dashed border-neutral-700 hover:border-orange-500/50 hover:bg-neutral-900 rounded-lg py-2 text-xs text-neutral-400 hover:text-orange-400 flex items-center justify-center gap-1.5"
+          >
+            <Plus size={12} /> Add Plate Type
+          </button>
+        </div>
+      </Section>
+    </>
+  );
+}
+
+function CustomWeightsEditor({ weights, unit, onChange, hint }) {
+  const [newWeight, setNewWeight] = useState(0);
+  const [bulkText, setBulkText] = useState('');
+
+  const sortedWeights = useMemo(() => [...(weights || [])].sort((a, b) => a - b), [weights]);
+
+  const addWeight = (w) => {
+    if (!Number.isFinite(w) || w <= 0) return;
+    if (weights.includes(w)) return;
+    onChange([...weights, w].sort((a, b) => a - b));
+  };
+  const removeWeight = (w) => onChange(weights.filter(x => x !== w));
+  const commitBulk = () => {
+    const parsed = bulkText
+      .split(/[\s,;\n]+/)
+      .map(s => parseFloat(s))
+      .filter(n => Number.isFinite(n) && n > 0);
+    if (!parsed.length) return;
+    const merged = Array.from(new Set([...weights, ...parsed])).sort((a, b) => a - b);
+    onChange(merged);
+    setBulkText('');
+  };
+
+  return (
+    <>
+      <Section label="Available Weights">
+        <div className="text-[10px] text-neutral-500 mb-2 px-1 leading-relaxed">{hint}</div>
+
+        {sortedWeights.length > 0 && (
+          <div className="bg-neutral-900 border border-neutral-800 rounded-lg p-3 mb-2 flex flex-wrap gap-1.5">
+            {sortedWeights.map(w => (
+              <span key={w} className="font-mono text-xs text-neutral-200 bg-neutral-800 rounded px-2 py-1 flex items-center gap-1.5">
+                {fmt(w)}{unit}
+                <button
+                  onClick={() => removeWeight(w)}
+                  aria-label={`Remove ${w}`}
+                  className="text-neutral-500 hover:text-red-400"
+                >
+                  <X size={10} strokeWidth={3} />
+                </button>
+              </span>
+            ))}
+          </div>
+        )}
+
+        <div className="flex items-end gap-2">
+          <div className="flex-1">
+            <div className="text-[9px] uppercase tracking-widest text-neutral-500 mb-1 px-1">Add weight</div>
+            <Stepper value={newWeight} onChange={setNewWeight} step={1} min={0} max={1000} />
+          </div>
+          <button
+            onClick={() => { addWeight(newWeight); setNewWeight(0); }}
+            disabled={newWeight <= 0}
+            className="h-[40px] px-3 bg-orange-500 hover:bg-orange-400 disabled:bg-neutral-800 disabled:text-neutral-600 text-black font-bold uppercase tracking-wider text-xs rounded-lg"
+          >
+            Add
+          </button>
+        </div>
+
+        <div className="mt-3">
+          <div className="text-[9px] uppercase tracking-widest text-neutral-500 mb-1 px-1">Bulk paste</div>
+          <textarea
+            value={bulkText}
+            onChange={e => setBulkText(e.target.value)}
+            placeholder="e.g. 17, 22, 27, 32, 37, 42"
+            rows={2}
+            className="w-full bg-neutral-900 border border-neutral-800 rounded-lg px-2 py-1.5 text-sm text-white placeholder:text-neutral-600 focus:outline-none focus:border-orange-500 font-mono"
+          />
+          <button
+            onClick={commitBulk}
+            disabled={!bulkText.trim()}
+            className="w-full mt-1.5 bg-neutral-800 hover:bg-neutral-700 disabled:opacity-40 text-neutral-300 text-xs uppercase tracking-widest font-bold py-2 rounded-lg"
+          >
+            Parse & Add
+          </button>
+        </div>
+      </Section>
+    </>
+  );
+}
+
+function SettingsScreen({ settings, onChange, history, onReset, onExport, install, online, onShowInstall }) {
   const update = (k, v) => onChange({ ...settings, [k]: v });
+
+  // Sub-screen: editing a specific exercise's loading profile, or the
+  // global default. null = top-level settings view. 'default' = editing
+  // the global default. otherwise the exercise name being edited.
+  const [editingProfileFor, setEditingProfileFor] = useState(null);
+
+  // Known exercise names — union of past history names and built-ins
+  // that have been used. We only show those that have been logged at
+  // least once, plus user-created ones, to keep the list relevant.
+  const knownExercises = useMemo(() => {
+    const names = new Set();
+    history.forEach(w => w.exercises.forEach(e => names.add(e.name)));
+    return Array.from(names).sort();
+  }, [history]);
+
+  // Sub-screen rendering — pull out for clarity. Same scaffold as the
+  // top-level settings page so the user sees a TopBar with a back button
+  // and consistent layout.
+  if (editingProfileFor !== null) {
+    const target = editingProfileFor;
+    const currentProfile = target === 'default'
+      ? (settings.defaultProfile || DEFAULT_PROFILE)
+      : (settings.exerciseProfiles?.[target] || settings.defaultProfile || DEFAULT_PROFILE);
+
+    const handleProfileSave = (newProfile) => {
+      if (target === 'default') {
+        onChange({ ...settings, defaultProfile: newProfile });
+      } else {
+        onChange({
+          ...settings,
+          exerciseProfiles: { ...(settings.exerciseProfiles || {}), [target]: newProfile },
+        });
+      }
+      setEditingProfileFor(null);
+    };
+
+    const handleProfileReset = () => {
+      // "Reset to default" — remove the per-exercise override so it inherits.
+      if (target !== 'default') {
+        const next = { ...(settings.exerciseProfiles || {}) };
+        delete next[target];
+        onChange({ ...settings, exerciseProfiles: next });
+      }
+      setEditingProfileFor(null);
+    };
+
+    return (
+      <ProfileEditorScreen
+        title={target === 'default' ? 'Default Loading' : target}
+        profile={currentProfile}
+        unit={settings.unit}
+        isOverride={target !== 'default' && !!(settings.exerciseProfiles?.[target])}
+        onSave={handleProfileSave}
+        onResetToDefault={target !== 'default' ? handleProfileReset : null}
+        onBack={() => setEditingProfileFor(null)}
+      />
+    );
+  }
+
+  // Format storage usage in human terms.
+  const storageLine = useMemo(() => {
+    const info = install.storageInfo;
+    if (!info || !info.quota) return null;
+    const usedKB = Math.round(info.usage / 1024);
+    const quotaMB = Math.round(info.quota / (1024 * 1024));
+    return `${usedKB} KB used of ${quotaMB} MB available`;
+  }, [install.storageInfo]);
 
   return (
     <div className="pb-24 slide-up">
@@ -1808,15 +2846,47 @@ function SettingsScreen({ settings, onChange, history, onReset, onExport, instal
               Install on this device
             </button>
             <div className="text-[10px] text-neutral-500 mt-2 px-1">
-              Adds HyperCoach to your home screen for full-screen, offline use.
+              Adds HyperCoach to your home screen. Once installed, the app works
+              fully offline — no server, no internet required.
             </div>
           </Section>
         )}
         {install.isStandalone && (
-          <Section label="App Install">
-            <div className="bg-neutral-900 border border-neutral-800 rounded-lg p-3.5 flex items-center gap-3">
-              <CheckCircle2 size={18} className="text-lime-400 flex-shrink-0" />
-              <div className="text-sm text-neutral-300">Installed and running standalone.</div>
+          <Section label="App Status">
+            <div className="bg-neutral-900 border border-neutral-800 rounded-lg p-3.5 space-y-2">
+              <div className="flex items-center gap-3">
+                <CheckCircle2 size={18} className="text-lime-400 flex-shrink-0" />
+                <div className="text-sm text-neutral-200">Installed · running standalone</div>
+              </div>
+              <div className="flex items-center gap-3">
+                {online ? (
+                  <Wifi size={18} className="text-neutral-400 flex-shrink-0" />
+                ) : (
+                  <WifiOff size={18} className="text-amber-400 flex-shrink-0" />
+                )}
+                <div className="text-sm text-neutral-300">
+                  {online ? 'Online — but app does not need it.' : 'Offline — app still works.'}
+                </div>
+              </div>
+              {install.persisted?.persisted && (
+                <div className="flex items-center gap-3">
+                  <Shield size={18} className="text-lime-400 flex-shrink-0" />
+                  <div className="text-sm text-neutral-300">Storage marked persistent · safe from auto-eviction.</div>
+                </div>
+              )}
+              {install.persisted && !install.persisted.persisted && install.persisted.supported && (
+                <div className="flex items-center gap-3">
+                  <AlertTriangle size={18} className="text-amber-400 flex-shrink-0" />
+                  <div className="text-sm text-neutral-300">
+                    Storage not yet persistent. Browser may evict data after long inactivity.
+                  </div>
+                </div>
+              )}
+              {storageLine && (
+                <div className="text-[10px] text-neutral-500 pt-2 border-t border-neutral-800">
+                  {storageLine}
+                </div>
+              )}
             </div>
           </Section>
         )}
@@ -1828,7 +2898,7 @@ function SettingsScreen({ settings, onChange, history, onReset, onExport, instal
           </div>
         </Section>
 
-        <Section label="Weight Increment">
+        <Section label="Manual Stepper Increment">
           <div className="grid grid-cols-4 gap-2">
             {(settings.unit === 'kg' ? [1, 1.25, 2.5, 5] : [1, 2.5, 5, 10]).map(v => (
               <Pill key={v} active={settings.increment === v} onClick={() => update('increment', v)}>
@@ -1836,23 +2906,87 @@ function SettingsScreen({ settings, onChange, history, onReset, onExport, instal
               </Pill>
             ))}
           </div>
+          <div className="text-[10px] text-neutral-500 mt-2 px-1">
+            Only affects the +/− buttons when typing a weight manually.
+            Recommendations are snapped using the exercise's loading profile below.
+          </div>
+        </Section>
+
+        {/* Exercise Loading Settings — the killer feature */}
+        <Section label="Exercise Loading">
+          <button
+            onClick={() => setEditingProfileFor('default')}
+            className="w-full bg-neutral-900 hover:bg-neutral-800 border border-neutral-800 rounded-lg p-3 flex items-center justify-between text-left mb-2"
+          >
+            <div className="flex items-center gap-3 min-w-0">
+              <Sliders size={16} className="text-orange-500 flex-shrink-0" />
+              <div className="min-w-0">
+                <div className="text-sm text-white">Default Loading Profile</div>
+                <div className="text-[10px] text-neutral-500 truncate">
+                  {describeProfile(settings.defaultProfile || DEFAULT_PROFILE, settings.unit)}
+                </div>
+              </div>
+            </div>
+            <ChevronRight size={16} className="text-neutral-600 flex-shrink-0" />
+          </button>
+
+          {knownExercises.length > 0 ? (
+            <div className="space-y-1.5">
+              <div className="text-[9px] uppercase tracking-widest text-neutral-600 mt-3 mb-1 px-1">
+                Per-Exercise Overrides
+              </div>
+              {knownExercises.map(name => {
+                const hasOverride = !!(settings.exerciseProfiles?.[name]);
+                const profile = settings.exerciseProfiles?.[name];
+                return (
+                  <button
+                    key={name}
+                    onClick={() => setEditingProfileFor(name)}
+                    className="w-full bg-neutral-900 hover:bg-neutral-800 border border-neutral-800 rounded-lg p-3 flex items-center justify-between text-left"
+                  >
+                    <div className="min-w-0 flex-1">
+                      <div className="flex items-center gap-2">
+                        <span className="text-sm text-white truncate">{name}</span>
+                        {hasOverride && (
+                          <span className="text-[9px] uppercase tracking-widest text-orange-400 bg-orange-500/10 border border-orange-500/30 rounded px-1.5 py-0.5 font-bold flex-shrink-0">
+                            Custom
+                          </span>
+                        )}
+                      </div>
+                      <div className="text-[10px] text-neutral-500 truncate mt-0.5">
+                        {hasOverride
+                          ? describeProfile(profile, settings.unit)
+                          : 'Inherits default'}
+                      </div>
+                    </div>
+                    <ChevronRight size={16} className="text-neutral-600 flex-shrink-0 ml-2" />
+                  </button>
+                );
+              })}
+            </div>
+          ) : (
+            <div className="text-[10px] text-neutral-600 mt-2 px-1 leading-relaxed">
+              Log an exercise once and it'll appear here so you can configure its
+              equipment-specific weight options.
+            </div>
+          )}
         </Section>
 
         <Section label={`Target Rep Range (${settings.targetMin}–${settings.targetMax})`}>
           <div className="grid grid-cols-2 gap-3">
             <div>
               <div className="text-[10px] uppercase tracking-widest text-neutral-500 mb-1.5 px-1">Min</div>
-              <Stepper value={settings.targetMin} onChange={v => update('targetMin', Math.round(v))} step={1} min={1} max={settings.targetMax - 1} />
+              <Stepper value={settings.targetMin} onChange={v => update('targetMin', Math.round(v))} step={1} min={1} max={settings.targetMax - 1} allowDecimal={false} />
             </div>
             <div>
               <div className="text-[10px] uppercase tracking-widest text-neutral-500 mb-1.5 px-1">Max</div>
-              <Stepper value={settings.targetMax} onChange={v => update('targetMax', Math.round(v))} step={1} min={settings.targetMin + 1} max={30} />
+              <Stepper value={settings.targetMax} onChange={v => update('targetMax', Math.round(v))} step={1} min={settings.targetMin + 1} max={30} allowDecimal={false} />
             </div>
           </div>
         </Section>
 
         <Section label={`Ideal Target Reps (${settings.targetIdeal})`}>
-          <Stepper value={settings.targetIdeal} onChange={v => update('targetIdeal', Math.round(v))} step={1} min={settings.targetMin} max={settings.targetMax} />
+          <Stepper value={settings.targetIdeal} onChange={v => update('targetIdeal', Math.round(v))} step={1} min={settings.targetMin} max={settings.targetMax} allowDecimal={false} />
         </Section>
 
         <Section label="Data">
@@ -1921,13 +3055,34 @@ export default function App() {
   const [loaded, setLoaded] = useState(false);
   const [confirm, setConfirm] = useState(null);
   const [showInstall, setShowInstall] = useState(false);
+  // Editing a previously-completed workout. Holds the original; the edit
+  // screen tracks its own draft locally.
+  const [editingWorkout, setEditingWorkout] = useState(null);
   const install = useInstallPrompt();
+
+  // Track online/offline so we can give the user honest feedback. The app
+  // works the same either way — this is just transparency.
+  const [online, setOnline] = useState(typeof navigator !== 'undefined' ? navigator.onLine : true);
+  useEffect(() => {
+    const goOnline = () => setOnline(true);
+    const goOffline = () => setOnline(false);
+    window.addEventListener('online', goOnline);
+    window.addEventListener('offline', goOffline);
+    return () => {
+      window.removeEventListener('online', goOnline);
+      window.removeEventListener('offline', goOffline);
+    };
+  }, []);
 
   // Load
   useEffect(() => {
     const h = storage.get(STORAGE_KEYS.history);
     const s = storage.get(STORAGE_KEYS.settings);
-    if (Array.isArray(h)) setHistory(h);
+    if (Array.isArray(h)) {
+      // Migration: older workouts have no `status` field. Treat them as
+      // completed so they keep working as session history.
+      setHistory(h.map(w => w.status ? w : { ...w, status: 'completed' }));
+    }
     if (s) setSettings({ ...DEFAULT_SETTINGS, ...s });
     setLoaded(true);
   }, []);
@@ -1936,13 +3091,31 @@ export default function App() {
   useEffect(() => { if (loaded) storage.set(STORAGE_KEYS.history, history); }, [history, loaded]);
   useEffect(() => { if (loaded) storage.set(STORAGE_KEYS.settings, settings); }, [settings, loaded]);
 
+  // Most-recently-paused workouts surface on Home for resume.
+  const pausedWorkouts = useMemo(
+    () => history
+      .filter(w => w.status === 'paused')
+      .sort((a, b) => (b.pausedAt || b.startedAt) - (a.pausedAt || a.startedAt)),
+    [history]
+  );
+
   const startWorkout = () => {
-    setWorkout({ id: `w_${Date.now()}`, startedAt: Date.now(), exercises: [] });
+    setWorkout({
+      id: `w_${Date.now()}`,
+      startedAt: Date.now(),
+      exercises: [],
+      status: 'in_progress',
+    });
     setScreen('exercise-select');
   };
 
   const startWorkoutWith = (name) => {
-    const w = { id: `w_${Date.now()}`, startedAt: Date.now(), exercises: [{ name, sets: [] }] };
+    const w = {
+      id: `w_${Date.now()}`,
+      startedAt: Date.now(),
+      exercises: [{ name, sets: [] }],
+      status: 'in_progress',
+    };
     setWorkout(w);
     setActiveExerciseIdx(0);
     setScreen('workout');
@@ -2018,24 +3191,163 @@ export default function App() {
     });
   };
 
+  // Edit a completed workout. The screen tracks its own draft state; on
+  // Save we replace the history record. PRs, e1RM, progression targets,
+  // and next-workout recommendations all derive from history so they
+  // recompute automatically.
+  const startEditingWorkout = (w) => {
+    setEditingWorkout(w);
+    setScreen('edit-workout');
+  };
+
+  const saveEditedWorkout = (updated) => {
+    // Replace by id; if all exercises got removed during edit, drop it.
+    if (!updated.exercises.length) {
+      setHistory(history.filter(w => w.id !== updated.id));
+    } else {
+      setHistory(history.map(w => w.id === updated.id ? updated : w));
+    }
+    setEditingWorkout(null);
+    setScreen('history');
+  };
+
+  const cancelEditingWorkout = () => {
+    setEditingWorkout(null);
+    setScreen('history');
+  };
+
+  // ============================================================
+  // Workout lifecycle: finish / pause / discard / resume
+  // ============================================================
+
   const finishWorkout = () => {
     if (!workout) return;
-    const valid = {
-      ...workout,
-      exercises: workout.exercises.filter(e => e.sets.length > 0),
-      completedAt: Date.now(),
-    };
-    if (valid.exercises.length === 0) {
-      // discard
+    // No sets at all → silently discard, no confirm. Nothing to confirm.
+    const hasAnySets = workout.exercises.some(e => e.sets.length > 0);
+    if (!hasAnySets) {
       setWorkout(null);
       setScreen('home');
       return;
     }
-    setHistorySnapshotForSummary(history);
-    setCompletedWorkout(valid);
-    setHistory([...history, valid]);
+    setConfirm({
+      title: 'Finish workout?',
+      body: 'This marks the workout as completed. Recommendations and PRs will update based on it.',
+      confirmLabel: 'Finish',
+      onConfirm: () => {
+        const valid = {
+          ...workout,
+          exercises: workout.exercises.filter(e => e.sets.length > 0),
+          status: 'completed',
+          completedAt: Date.now(),
+        };
+        setHistorySnapshotForSummary(history);
+        setCompletedWorkout(valid);
+        setHistory([...history, valid]);
+        setWorkout(null);
+        setConfirm(null);
+        setScreen('summary');
+      },
+      onCancel: () => setConfirm(null),
+    });
+  };
+
+  // Silently save the current workout as paused. No confirm — exiting the
+  // workout should be friction-free. The user can resume from Home.
+  const pauseWorkout = () => {
+    if (!workout) return;
+    // Don't pause if there's nothing in the workout — just discard quietly.
+    const hasAnySets = workout.exercises.some(e => e.sets.length > 0);
+    if (!hasAnySets) {
+      setWorkout(null);
+      setScreen('home');
+      return;
+    }
+    const paused = {
+      ...workout,
+      status: 'paused',
+      pausedAt: Date.now(),
+    };
+    // Replace if this workout was already in history (resumed-then-paused),
+    // else append.
+    const existsIdx = history.findIndex(w => w.id === paused.id);
+    let nextHistory;
+    if (existsIdx >= 0) {
+      nextHistory = [...history];
+      nextHistory[existsIdx] = paused;
+    } else {
+      nextHistory = [...history, paused];
+    }
+    setHistory(nextHistory);
     setWorkout(null);
-    setScreen('summary');
+    setScreen('home');
+  };
+
+  const discardWorkout = () => {
+    if (!workout) return;
+    const hasAnySets = workout.exercises.some(e => e.sets.length > 0);
+    // No sets → no need to confirm, just drop.
+    if (!hasAnySets) {
+      setWorkout(null);
+      setScreen('home');
+      return;
+    }
+    setConfirm({
+      title: 'Discard workout?',
+      body: 'All logged sets will be permanently deleted. This cannot be undone.',
+      confirmLabel: 'Discard',
+      danger: true,
+      onConfirm: () => {
+        // Also remove from history in case this was a previously-paused workout.
+        setHistory(history.filter(w => w.id !== workout.id));
+        setWorkout(null);
+        setConfirm(null);
+        setScreen('home');
+      },
+      onCancel: () => setConfirm(null),
+    });
+  };
+
+  const resumePausedWorkout = (workoutId) => {
+    const target = history.find(w => w.id === workoutId && w.status === 'paused');
+    if (!target) return;
+
+    // If there's an in-progress workout, save it as paused before swapping.
+    // This avoids losing the user's current work when they tap Resume by mistake.
+    let nextHistory = history.filter(w => w.id !== workoutId);
+    if (workout && workout.exercises.some(e => e.sets.length > 0)) {
+      const stashed = { ...workout, status: 'paused', pausedAt: Date.now() };
+      const existsIdx = nextHistory.findIndex(w => w.id === stashed.id);
+      if (existsIdx >= 0) {
+        nextHistory = [...nextHistory];
+        nextHistory[existsIdx] = stashed;
+      } else {
+        nextHistory = [...nextHistory, stashed];
+      }
+    }
+
+    const { status: _s, pausedAt: _p, ...resumed } = target;
+    setWorkout({ ...resumed, status: 'in_progress' });
+    setHistory(nextHistory);
+    // Pick the last exercise that has any sets, or first overall.
+    const lastWithSets = resumed.exercises.findIndex(e => e.sets.length > 0);
+    setActiveExerciseIdx(Math.max(0, lastWithSets));
+    setScreen('workout');
+  };
+
+  const discardPausedWorkout = (workoutId) => {
+    const target = history.find(w => w.id === workoutId);
+    if (!target) return;
+    setConfirm({
+      title: 'Discard paused workout?',
+      body: 'This deletes the paused session permanently.',
+      confirmLabel: 'Discard',
+      danger: true,
+      onConfirm: () => {
+        setHistory(history.filter(w => w.id !== workoutId));
+        setConfirm(null);
+      },
+      onCancel: () => setConfirm(null),
+    });
   };
 
   const handleAddExercise = () => setScreen('exercise-select');
@@ -2044,30 +3356,16 @@ export default function App() {
     if (workout && workout.exercises.length > 0) {
       setScreen('workout');
     } else {
+      // No exercises selected yet → don't leave a junk paused workout
       setWorkout(null);
       setScreen('home');
     }
   };
 
+  // Back button on the workout screen pauses silently. The user gets their
+  // workout back from the Home screen's Resume card.
   const handleBackFromWorkout = () => {
-    setConfirm({
-      title: 'Pause workout?',
-      body: 'Your sets so far will be kept. You can finish from the workout screen.',
-      confirmLabel: 'Go Home',
-      onConfirm: () => {
-        // Save in-progress workout into history? For simplicity we discard the in-progress one.
-        // Better behavior: keep it as resumable. For now, finish if any sets logged, else discard.
-        const hasSets = workout && workout.exercises.some(e => e.sets.length > 0);
-        if (hasSets) {
-          finishWorkout();
-        } else {
-          setWorkout(null);
-          setScreen('home');
-        }
-        setConfirm(null);
-      },
-      onCancel: () => setConfirm(null),
-    });
+    pauseWorkout();
   };
 
   const handleExport = () => {
@@ -2096,7 +3394,7 @@ export default function App() {
     });
   };
 
-  const inWorkout = screen === 'workout' || screen === 'exercise-select' || screen === 'summary';
+  const inWorkout = screen === 'workout' || screen === 'exercise-select' || screen === 'summary' || screen === 'edit-workout';
 
   if (!loaded) {
     return (
@@ -2118,7 +3416,11 @@ export default function App() {
             onOpenExercise={(name) => startWorkoutWith(name)}
             settings={settings}
             install={install}
+            online={online}
             onShowInstall={() => setShowInstall(true)}
+            pausedWorkouts={pausedWorkouts}
+            onResumePaused={resumePausedWorkout}
+            onDiscardPaused={discardPausedWorkout}
           />
         )}
         {screen === 'exercise-select' && (
@@ -2139,6 +3441,7 @@ export default function App() {
             onAddExercise={handleAddExercise}
             onFinishExercise={() => setScreen('exercise-select')}
             onFinishWorkout={finishWorkout}
+            onDiscardWorkout={discardWorkout}
             onBack={handleBackFromWorkout}
           />
         )}
@@ -2154,7 +3457,20 @@ export default function App() {
           />
         )}
         {screen === 'history' && (
-          <HistoryScreen history={history} settings={settings} onDeleteWorkout={deleteWorkout} />
+          <HistoryScreen
+            history={history}
+            settings={settings}
+            onDeleteWorkout={deleteWorkout}
+            onEditWorkout={startEditingWorkout}
+          />
+        )}
+        {screen === 'edit-workout' && editingWorkout && (
+          <EditWorkoutScreen
+            workout={editingWorkout}
+            settings={settings}
+            onSave={saveEditedWorkout}
+            onBack={cancelEditingWorkout}
+          />
         )}
         {screen === 'settings' && (
           <SettingsScreen
@@ -2164,6 +3480,7 @@ export default function App() {
             onReset={handleReset}
             onExport={handleExport}
             install={install}
+            online={online}
             onShowInstall={() => setShowInstall(true)}
           />
         )}

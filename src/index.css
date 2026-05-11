@@ -2,11 +2,49 @@
 @tailwind components;
 @tailwind utilities;
 
-/* iOS safe areas. We only pad the top globally — left/right would shrink the
-   centered phone-width column on landscape, and bottom is handled by the
-   fixed BottomNav itself so it can sit flush against the home indicator. */
+/* iOS safe areas. Pad the top globally so content clears the notch.
+   Bottom safe-area is handled inside the fixed BottomNav component
+   so it can sit flush against the home indicator. */
 @supports (padding: max(0px)) {
   body {
     padding-top: env(safe-area-inset-top);
   }
 }
+
+/* Display-font fake.
+   We're not loading webfonts (offline-first means no network on first
+   install). To get the chunky condensed gym-poster look, we lean on
+   font-stretch where the system supports it (modern SF on iOS,
+   Roboto on Android), plus heavy weight and tight letter tracking. */
+.font-display {
+  font-family: 'SF Pro Display', -apple-system, BlinkMacSystemFont,
+               'Helvetica Neue Condensed', 'Arial Narrow', sans-serif;
+  font-stretch: condensed;
+  font-weight: 900;
+  letter-spacing: 0.01em;
+  text-transform: uppercase;
+}
+
+/* Hide scrollbars on horizontal scroll strips. */
+.scrollbar-hide::-webkit-scrollbar { display: none; }
+.scrollbar-hide { -ms-overflow-style: none; scrollbar-width: none; }
+
+/* Strip the spinner from number inputs — we use custom +/− steppers. */
+input[type=number]::-webkit-inner-spin-button,
+input[type=number]::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
+input[type=number] { -moz-appearance: textfield; }
+
+/* Subtle pulse around the start-workout CTA. */
+@keyframes pulse-ring {
+  0%   { box-shadow: 0 0 0 0 rgba(249, 115, 22, 0.4); }
+  70%  { box-shadow: 0 0 0 12px rgba(249, 115, 22, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(249, 115, 22, 0); }
+}
+.pulse-ring { animation: pulse-ring 2s infinite; }
+
+/* Slide-up for screen transitions. */
+@keyframes slide-up {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.slide-up { animation: slide-up 0.3s ease-out; }
